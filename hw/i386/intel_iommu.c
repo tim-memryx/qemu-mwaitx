@@ -2733,6 +2733,12 @@ static void vtd_handle_gcmd_write(IntelIOMMUState *s)
         /* Set/update the interrupt remapping root-table pointer */
         vtd_handle_gcmd_sirtp(s);
     }
+    if ((changed & VTD_GCMD_CFI) &&
+        x86_iommu_ir_supported(x86_iommu)) {
+        /* Retain CFI even while IR is disabled; it applies when IRE is set. */
+        vtd_set_clear_mask_long(s, DMAR_GSTS_REG, VTD_GSTS_CFIS,
+                               (val & VTD_GCMD_CFI) ? VTD_GSTS_CFIS : 0);
+    }
     if ((changed & VTD_GCMD_IRE) &&
         x86_iommu_ir_supported(x86_iommu)) {
         /* Interrupt remap enable/disable */
@@ -4374,8 +4380,15 @@ static int vtd_interrupt_remap_msi(IntelIOMMUState *iommu,
         return -EINVAL;
     }
 
-    /* This is compatible mode. */
+    /* VT-d section 5.1.4: EIME always blocks compatibility-format requests. */
     if (addr.addr.int_mode != VTD_IR_INT_FORMAT_REMAP) {
+        if (iommu->intr_eime ||
+            !(vtd_get_long_raw(iommu, DMAR_GSTS_REG) & VTD_GSTS_CFIS)) {
+            if (do_fault) {
+                vtd_report_ir_fault(iommu, sid, VTD_FR_IR_REQ_COMPAT, 0);
+            }
+            return -EINVAL;
+        }
         memcpy(translated, origin, sizeof(*origin));
         goto out;
     }
