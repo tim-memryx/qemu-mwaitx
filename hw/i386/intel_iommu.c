@@ -3525,6 +3525,10 @@ static void vtd_fetch_inv_desc(IntelIOMMUState *s)
 {
     int qi_shift;
 
+    if (s->tunix_qi_stall) {
+        return; /* Keep the accepted tail and all descriptors pending. */
+    }
+
     /* Refer to 10.4.23 of VT-d spec 3.0 */
     qi_shift = s->iq_dw ? VTD_IQH_QH_SHIFT_5 : VTD_IQH_QH_SHIFT_4;
 
@@ -5199,6 +5203,7 @@ static void vtd_reset_exit(Object *obj, ResetType type)
     IntelIOMMUState *s = INTEL_IOMMU_DEVICE(obj);
 
     trace_vtd_reset_exit();
+    s->tunix_qi_stall = false;
     vtd_init(s);
     vtd_address_space_refresh_all(s);
 }
@@ -5673,6 +5678,32 @@ static void vtd_realize(DeviceState *dev, Error **errp)
     x86ms->ioapic_as = vtd_host_dma_iommu(bus, s, Q35_PSEUDO_DEVFN_IOAPIC);
 }
 
+/*
+ * These host-only controls are diagnostic fixtures for non-migrating guests.
+ * They do not change advertised capabilities or manufacture completions.
+ */
+static bool vtd_tunix_stall_get(Object *obj, Error **errp)
+{
+    return INTEL_IOMMU_DEVICE(obj)->tunix_qi_stall;
+}
+
+static void vtd_tunix_stall_set(Object *obj, bool value, Error **errp)
+{
+    IntelIOMMUState *s = INTEL_IOMMU_DEVICE(obj);
+
+    s->tunix_qi_stall = value;
+    if (!value && s->qi_enabled &&
+        !(vtd_get_long_raw(s, DMAR_FSTS_REG) & VTD_FSTS_IQE)) {
+        vtd_fetch_inv_desc(s);
+    }
+}
+
+static void vtd_instance_init(Object *obj)
+{
+    object_property_add_bool(obj, "tunix-qi-stall", vtd_tunix_stall_get,
+                             vtd_tunix_stall_set);
+}
+
 static void vtd_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -5699,6 +5730,7 @@ static const TypeInfo vtd_info = {
     .name          = TYPE_INTEL_IOMMU_DEVICE,
     .parent        = TYPE_X86_IOMMU_DEVICE,
     .instance_size = sizeof(IntelIOMMUState),
+    .instance_init = vtd_instance_init,
     .class_init    = vtd_class_init,
 };
 

@@ -75,6 +75,8 @@ struct EduState {
     QEMUTimer dma_timer;
     char dma_buf[DMA_SIZE];
     uint64_t dma_mask;
+    uint64_t tunix_dma_completions, tunix_dma_failures;
+    uint64_t tunix_dma_delay_ms; /* Host-controlled retirement test fixture. */
 };
 
 static bool edu_msi_enabled(EduState *edu)
@@ -152,18 +154,23 @@ static void edu_dma_timer(void *opaque)
         uint64_t dst = edu->dma.dst;
         if (edu_check_range(dst, edu->dma.cnt, DMA_START, DMA_SIZE)) {
             dst -= DMA_START;
-            pci_dma_read(&edu->pdev, edu_clamp_addr(edu, edu->dma.src),
-                         edu->dma_buf + dst, edu->dma.cnt);
+            if (pci_dma_read(&edu->pdev, edu_clamp_addr(edu, edu->dma.src),
+                             edu->dma_buf + dst, edu->dma.cnt) != MEMTX_OK) {
+                edu->tunix_dma_failures++;
+            }
         }
     } else {
         uint64_t src = edu->dma.src;
         if (edu_check_range(src, edu->dma.cnt, DMA_START, DMA_SIZE)) {
             src -= DMA_START;
-            pci_dma_write(&edu->pdev, edu_clamp_addr(edu, edu->dma.dst),
-                          edu->dma_buf + src, edu->dma.cnt);
+            if (pci_dma_write(&edu->pdev, edu_clamp_addr(edu, edu->dma.dst),
+                              edu->dma_buf + src, edu->dma.cnt) != MEMTX_OK) {
+                edu->tunix_dma_failures++;
+            }
         }
     }
 
+    edu->tunix_dma_completions++;
     edu->dma.cmd &= ~EDU_DMA_RUN;
     if (edu->dma.cmd & EDU_DMA_IRQ) {
         raise_irq = true;
@@ -188,7 +195,8 @@ static void dma_rw(EduState *edu, bool write, dma_addr_t *val, dma_addr_t *dma,
     }
 
     if (timer) {
-        timer_mod(&edu->dma_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 100);
+        timer_mod(&edu->dma_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  MIN(edu->tunix_dma_delay_ms, 60000));
     }
 }
 
@@ -414,6 +422,16 @@ static void edu_instance_init(Object *obj)
 {
     EduState *edu = EDU(obj);
 
+    object_property_add_uint64_ptr(obj, "tunix-dma-completions",
+                                   &edu->tunix_dma_completions,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "tunix-dma-failures",
+                                   &edu->tunix_dma_failures,
+                                   OBJ_PROP_FLAG_READ);
+    edu->tunix_dma_delay_ms = 100;
+    object_property_add_uint64_ptr(obj, "tunix-dma-delay-ms",
+                                   &edu->tunix_dma_delay_ms,
+                                   OBJ_PROP_FLAG_READWRITE);
     edu->dma_mask = (1UL << 28) - 1;
     object_property_add_uint64_ptr(obj, "dma_mask",
                                    &edu->dma_mask, OBJ_PROP_FLAG_READWRITE);

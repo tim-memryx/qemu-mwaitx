@@ -200,6 +200,80 @@ static void test_intel_iommu_compat_interrupt(void)
     qtest_quit(s);
 }
 
+static void test_tunix_qi_stall(void)
+{
+    const uint64_t queue = 0x300000, completion = 0x301000;
+    QTestState *s = qtest_init("-M q35 -device intel-iommu,id=vi -nodefaults");
+
+    qtest_writeq(s, queue, (0x12345678ULL << 32) | VTD_INV_DESC_WAIT |
+                          VTD_INV_DESC_WAIT_SW);
+    qtest_writeq(s, queue + 8, completion);
+    vtd_reg_writeq(s, DMAR_IQA_REG, queue);
+    qtest_writel(s, Q35_HOST_BRIDGE_IOMMU_ADDR + DMAR_GCMD_REG, VTD_GCMD_QIE);
+    g_assert_cmphex(vtd_reg_readl(s, DMAR_GSTS_REG) & VTD_GSTS_QIES, !=, 0);
+    qtest_qmp_assert_success(s, "{'execute':'qom-set','arguments':{"
+                            "'path':'/machine/peripheral/vi',"
+                            "'property':'tunix-qi-stall','value':true}}");
+    vtd_reg_writeq(s, DMAR_IQT_REG, 16);
+    g_assert_cmphex(vtd_reg_readq(s, DMAR_IQH_REG), ==, 0);
+    g_assert_cmphex(qtest_readl(s, completion), ==, 0);
+    qtest_qmp_assert_success(s, "{'execute':'qom-set','arguments':{"
+                            "'path':'/machine/peripheral/vi',"
+                            "'property':'tunix-qi-stall','value':false}}");
+    g_assert_cmphex(vtd_reg_readq(s, DMAR_IQH_REG), ==, 16);
+    g_assert_cmphex(qtest_readl(s, completion), ==, 0x12345678);
+    g_assert_cmphex(vtd_reg_readl(s, DMAR_FSTS_REG), ==, 0);
+    qtest_quit(s);
+}
+
+static void test_tunix_edu_delay(void)
+{
+    QTestState *s;
+    const uint64_t source = 0x300000, destination = 0x301000;
+
+    if (!qtest_has_device("edu")) {
+        g_test_skip("EDU device not available");
+        return;
+    }
+    s = qtest_init("-M q35 -device edu,id=edu,addr=4 -nodefaults");
+    edu_config_write(s, 0x10, EDU_BAR);
+    edu_config_write(s, 4, 0x406);
+    qtest_writel(s, source, 0xdecafbad);
+    qtest_qmp_assert_success(s, "{'execute':'qom-set','arguments':{"
+                            "'path':'/machine/peripheral/edu',"
+                            "'property':'tunix-dma-delay-ms','value':500}}");
+    qtest_writeq(s, EDU_BAR + 0x80, source);
+    qtest_writeq(s, EDU_BAR + 0x88, 0x40000);
+    qtest_writeq(s, EDU_BAR + 0x90, 4);
+    qtest_writeq(s, EDU_BAR + 0x98, 1);
+    qtest_clock_step(s, 499000000);
+    g_assert_cmphex(qtest_readq(s, EDU_BAR + 0x98) & 1, !=, 0);
+    qtest_clock_step(s, 1000000);
+    g_assert_cmphex(qtest_readq(s, EDU_BAR + 0x98) & 1, ==, 0);
+    qtest_writeq(s, EDU_BAR + 0x80, 0x40000);
+    qtest_writeq(s, EDU_BAR + 0x88, destination);
+    qtest_writeq(s, EDU_BAR + 0x98, 3);
+    qtest_clock_step(s, 500000000);
+    g_assert_cmphex(qtest_readl(s, destination), ==, 0xdecafbad);
+    /* A late callback after BME removal retires without touching RAM. */
+    edu_config_write(s, 4, 0x402);
+    qtest_writel(s, destination, 0xfeedface);
+    qtest_writeq(s, EDU_BAR + 0x98, 3);
+    qtest_clock_step(s, 500000000);
+    g_assert_cmphex(qtest_readl(s, destination), ==, 0xfeedface);
+    QDict *result = qtest_qmp(s,
+        "{'execute':'qom-get','arguments':{'path':'/machine/peripheral/edu',"
+        "'property':'tunix-dma-completions'}}");
+    g_assert_cmpint(qdict_get_int(result, "return"), ==, 3);
+    qobject_unref(result);
+    result = qtest_qmp(s,
+        "{'execute':'qom-get','arguments':{'path':'/machine/peripheral/edu',"
+        "'property':'tunix-dma-failures'}}");
+    g_assert_cmpint(qdict_get_int(result, "return"), ==, 1);
+    qobject_unref(result);
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -207,6 +281,9 @@ int main(int argc, char **argv)
                    test_intel_iommu_8byte_access);
     qtest_add_func("/q35/intel-iommu/stage-1", test_intel_iommu_stage_1);
 
-    qtest_add_func("/q35/intel-iommu/compat-interrupt", test_intel_iommu_compat_interrupt);
+    qtest_add_func("/q35/intel-iommu/compat-interrupt",
+                   test_intel_iommu_compat_interrupt);
+    qtest_add_func("/q35/intel-iommu/tunix-qi-stall", test_tunix_qi_stall);
+    qtest_add_func("/q35/intel-iommu/tunix-edu-delay", test_tunix_edu_delay);
     return g_test_run();
 }
