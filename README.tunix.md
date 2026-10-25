@@ -13,6 +13,7 @@ The fixtures are mutable QOM properties, intended only for non-migrating tests:
 | Device/property | Default | Behavior |
 | --- | --- | --- |
 | intel-iommu / `tunix-qi-stall` | false | Retains an accepted queue tail without fetching descriptors. Clearing resumes real descriptor execution; system reset clears it. |
+| intel-iommu / `tunix-fault-overflow` | false | Sets architected primary fault-log overflow and generates its normal fault event, leaving translation operational. Getter reads the real sticky bit; guest W1C or setting false clears it. |
 | edu / `tunix-dma-delay-ms` | 100 | Delay for the next DMA timer, clamped to 60,000 ms. Changing it does not reschedule an already-issued command. |
 | edu / `tunix-dma-completions` | 0, read-only | Actual DMA timer callbacks that retire a RUN command. |
 | edu / `tunix-dma-failures` | 0, read-only | PCI DMA transactions returning a result other than MEMTX_OK. |

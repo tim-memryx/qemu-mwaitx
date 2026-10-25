@@ -5698,10 +5698,32 @@ static void vtd_tunix_stall_set(Object *obj, bool value, Error **errp)
     }
 }
 
+static bool vtd_tunix_overflow_get(Object *obj, Error **errp)
+{
+    return vtd_get_long_raw(INTEL_IOMMU_DEVICE(obj), DMAR_FSTS_REG) & VTD_FSTS_PFO;
+}
+
+static void vtd_tunix_overflow_set(Object *obj, bool value, Error **errp)
+{
+    IntelIOMMUState *s = INTEL_IOMMU_DEVICE(obj);
+    uint32_t before = vtd_get_long_raw(s, DMAR_FSTS_REG);
+
+    if (value) {
+        /* Diagnostic lost-record condition; translation is left operational. */
+        vtd_set_clear_mask_long(s, DMAR_FSTS_REG, 0, VTD_FSTS_PFO);
+        vtd_generate_fault_event(s, before);
+    } else {
+        vtd_set_clear_mask_long(s, DMAR_FSTS_REG, VTD_FSTS_PFO, 0);
+        vtd_handle_fsts_write(s);
+    }
+}
+
 static void vtd_instance_init(Object *obj)
 {
     object_property_add_bool(obj, "tunix-qi-stall", vtd_tunix_stall_get,
                              vtd_tunix_stall_set);
+    object_property_add_bool(obj, "tunix-fault-overflow", vtd_tunix_overflow_get,
+                             vtd_tunix_overflow_set);
 }
 
 static void vtd_class_init(ObjectClass *klass, const void *data)

@@ -274,6 +274,19 @@ static void test_tunix_edu_delay(void)
     qtest_quit(s);
 }
 
+static void test_tunix_fault_overflow(void)
+{
+    QTestState *s = qtest_init("-M q35 -device intel-iommu,id=vi -nodefaults");
+
+    qtest_qmp_assert_success(s, "{'execute':'qom-set','arguments':{"
+                            "'path':'/machine/peripheral/vi',"
+                            "'property':'tunix-fault-overflow','value':true}}");
+    g_assert_cmphex(vtd_reg_readl(s, DMAR_FSTS_REG) & VTD_FSTS_PFO, !=, 0);
+    qtest_writel(s, Q35_HOST_BRIDGE_IOMMU_ADDR + DMAR_FSTS_REG, VTD_FSTS_PFO);
+    g_assert_cmphex(vtd_reg_readl(s, DMAR_FSTS_REG), ==, 0);
+    qtest_quit(s);
+}
+
 static void test_tunix_edu_posted(void)
 {
     QTestState *s;
@@ -350,5 +363,6 @@ int main(int argc, char **argv)
     qtest_add_func("/q35/intel-iommu/tunix-qi-stall", test_tunix_qi_stall);
     qtest_add_func("/q35/intel-iommu/tunix-edu-delay", test_tunix_edu_delay);
     qtest_add_func("/q35/intel-iommu/tunix-edu-posted", test_tunix_edu_posted);
+    qtest_add_func("/q35/intel-iommu/tunix-fault-overflow", test_tunix_fault_overflow);
     return g_test_run();
 }
