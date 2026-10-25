@@ -33,6 +33,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IntelIOMMUState, INTEL_IOMMU_DEVICE)
 
 /* DMAR Hardware Unit Definition address (IOMMU unit) */
 #define Q35_HOST_BRIDGE_IOMMU_ADDR  0xfed90000ULL
+#define TUNIX_SECOND_IOMMU_ADDR    0xfed91000ULL
 
 #define VTD_PCI_BUS_MAX             256
 #define VTD_PCI_SLOT_MAX            32
@@ -259,6 +260,13 @@ union VTD_IR_MSIAddress {
 /* The iommu (DMAR) device state struct */
 struct IntelIOMMUState {
     X86IOMMUState x86_iommu;
+    /* Opt-in, non-migrating two-engine fixture; ownership is immutable. */
+    uint16_t tunix_split_devfn;
+    bool tunix_secondary;
+    IntelIOMMUState *tunix_child;
+    PCIBus *tunix_root_bus;
+    Notifier tunix_machine_done;
+    Error *tunix_migration_blocker;
     MemoryRegion csrmem;
     MemoryRegion mr_nodmar;
     MemoryRegion mr_ir;

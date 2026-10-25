@@ -11,6 +11,8 @@
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "hw/i386/intel_iommu_internal.h"
+#include "libqos/fw_cfg.h"
+#include "qemu/bswap.h"
 
 #define CAP_STAGE_1_FIXED1    (VTD_CAP_FRO | VTD_CAP_NFR | VTD_CAP_ND | \
                               VTD_CAP_MAMV | VTD_CAP_PSI | VTD_CAP_SSLPS)
@@ -351,6 +353,155 @@ static void test_tunix_edu_posted(void)
     qtest_quit(s);
 }
 
+static void split_config(QTestState *s, unsigned rid, unsigned offset, uint32_t value)
+{
+    qtest_outl(s, 0xcf8, 0x80000000 | (rid << 8) | offset);
+    qtest_outl(s, 0xcfc, value);
+}
+
+static uint32_t split_read(QTestState *s, unsigned rid, unsigned offset)
+{
+    qtest_outl(s, 0xcf8, 0x80000000 | (rid << 8) | offset);
+    return qtest_inl(s, 0xcfc);
+}
+
+static void split_dma(QTestState *s, uint64_t bar, bool to_ram)
+{
+    qtest_writeq(s, bar + 0x80, to_ram ? 0x40000 : 0x1000);
+    qtest_writeq(s, bar + 0x88, to_ram ? 0x1000 : 0x40000);
+    qtest_writeq(s, bar + 0x90, 8);
+    qtest_writeq(s, bar + 0x98, to_ram ? 3 : 1);
+    qtest_clock_step(s, 100000000);
+    g_assert_cmphex(qtest_readq(s, bar + 0x98) & 1, ==, 0);
+}
+
+static void test_tunix_split_engines(void)
+{
+    const uint64_t units[] = {Q35_HOST_BRIDGE_IOMMU_ADDR, TUNIX_SECOND_IOMMU_ADDR};
+    const uint64_t bars[] = {0x10000000, 0x10200000};
+    const uint64_t roots[] = {0x400000, 0x410000};
+    unsigned caps[2];
+    QTestState *s = qtest_init("-M q35 -nodefaults "
+        "-device intel-iommu,id=vi,intremap=on,tunix-split-devfn=24 "
+        "-device pcie-root-port,id=rp1,addr=2,chassis=1 "
+        "-device pcie-root-port,id=rp2,addr=3,chassis=2 "
+        "-device edu,id=edu0,bus=rp1,addr=0 "
+        "-device edu,id=edu1,bus=rp2,addr=0");
+
+    for (unsigned i = 0; i < 2; i++) {
+        unsigned bus = i + 1, rid = bus << 8;
+        uint64_t root = roots[i], unit = units[i];
+        unsigned port = (i + 2) << 3;
+
+        split_config(s, port, 0x18, (bus << 8) | (bus << 16));
+        split_config(s, port, 0x20, ((bars[i] >> 16) & 0xfff0) | (bars[i] & 0xfff00000));
+        split_config(s, port, 4, 6);
+        g_assert_cmphex(split_read(s, rid, 0), ==, 0x11e81234);
+        split_config(s, rid, 0x10, bars[i]);
+        split_config(s, rid, 4, 0x406);
+        g_assert_cmphex(qtest_readl(s, bars[i]), ==, 0x010000ed);
+        /* Equal domain IDs/IOVAs, different physical translations per engine. */
+        qtest_writeq(s, root + bus * 16, (root + 0x1000) | 1);
+        qtest_writeq(s, root + 0x1000, (root + 0x2000) | 1);
+        qtest_writeq(s, root + 0x1008, (1 << 8) | 1);
+        qtest_writeq(s, root + 0x2000, (root + 0x3000) | 3);
+        qtest_writeq(s, root + 0x3000, (root + 0x4000) | 3);
+        qtest_writeq(s, root + 0x4008, (root + 0x5000) | 3);
+        qtest_writeq(s, root + 0x6000, (0x41 << 16) | 1);
+        qtest_writeq(s, root + 0x6008, rid | (1 << 18));
+        qtest_writeq(s, unit + DMAR_RTADDR_REG, root);
+        qtest_writeq(s, unit + DMAR_IRTA_REG, root + 0x6000);
+        qtest_writeq(s, unit + DMAR_IQA_REG, root + 0x7000);
+        qtest_writel(s, unit + DMAR_GCMD_REG, VTD_GCMD_SRTP | VTD_GCMD_SIRTP |
+                     VTD_GCMD_TE | VTD_GCMD_IRE | VTD_GCMD_QIE);
+        g_assert_cmphex(qtest_readl(s, unit + DMAR_GSTS_REG) &
+                       (VTD_GSTS_TES | VTD_GSTS_IRES | VTD_GSTS_QIES), ==,
+                       VTD_GSTS_TES | VTD_GSTS_IRES | VTD_GSTS_QIES);
+        qtest_writeq(s, root + 0x5000, 0xdecafbad00000000ULL + i);
+        split_dma(s, bars[i], false);
+        qtest_writeq(s, root + 0x5000, 0);
+        split_dma(s, bars[i], true);
+        g_assert_cmphex(qtest_readq(s, root + 0x5000), ==, 0xdecafbad00000000ULL + i);
+        caps[i] = split_read(s, rid, 0x34) & 255;
+        unsigned steps = 0;
+        while (caps[i] && (split_read(s, rid, caps[i]) & 255) != 5 && ++steps < 48) {
+            caps[i] = (split_read(s, rid, caps[i]) >> 8) & 255;
+        }
+        g_assert_cmpuint(caps[i], !=, 0);
+        g_assert_cmpuint(steps, <, 48);
+        split_config(s, rid, caps[i] + 4, 0xfee00018);
+        split_config(s, rid, caps[i] + 8, 0);
+        split_config(s, rid, caps[i] + 12, 0);
+        split_config(s, rid, caps[i], split_read(s, rid, caps[i]) | (1 << 16));
+        qtest_writel(s, bars[i] + 0x60, 1);
+        g_assert_cmphex(qtest_readl(s, unit + DMAR_FSTS_REG), ==, 0);
+    }
+    /* MSI source rejection belongs only to the unit receiving that PCI write. */
+    qtest_writeq(s, roots[1] + 0x6010, (0x41 << 16) | 1);
+    qtest_writeq(s, roots[1] + 0x6018, 0x100 | (1 << 18));
+    split_config(s, 0x200, caps[1] + 4, 0xfee00038); /* Fresh, uncached index. */
+    qtest_writel(s, bars[1] + 0x64, UINT32_MAX);
+    qtest_writel(s, bars[1] + 0x60, 1);
+    uint64_t fault = qtest_readq(s, units[1] + DMAR_FRCD_REG_0_2);
+    g_assert_cmphex(fault & VTD_FRCD_F, !=, 0);
+    g_assert_cmphex(fault & VTD_FRCD_SID_MASK, ==, 0x200);
+    g_assert_cmphex((fault >> 32) & 255, ==, VTD_FR_IR_SID_ERR);
+    g_assert_cmphex(qtest_readl(s, units[0] + DMAR_FSTS_REG), ==, 0);
+    qtest_writeq(s, units[1] + DMAR_FRCD_REG_0_2, VTD_FRCD_F);
+
+    qtest_qmp_assert_success(s, "{'execute':'qom-set','arguments':{"
+        "'path':'/machine/peripheral/vi/tunix-secondary',"
+        "'property':'tunix-qi-stall','value':true}}");
+    for (unsigned i = 0; i < 2; i++) {
+        qtest_writeq(s, roots[i] + 0x7000, (0x12345678ULL << 32) |
+                     VTD_INV_DESC_WAIT | VTD_INV_DESC_WAIT_SW);
+        qtest_writeq(s, roots[i] + 0x7008, roots[i] + 0x8000);
+        qtest_writeq(s, units[i] + DMAR_IQT_REG, 16);
+        g_assert_cmphex(qtest_readq(s, units[i] + DMAR_IQH_REG), ==, i ? 0 : 16);
+        g_assert_cmphex(qtest_readl(s, roots[i] + 0x8000), ==, i ? 0 : 0x12345678);
+    }
+    qtest_qmp_assert_success(s, "{'execute':'qom-set','arguments':{"
+        "'path':'/machine/peripheral/vi/tunix-secondary',"
+        "'property':'tunix-qi-stall','value':false}}");
+    g_assert_cmphex(qtest_readl(s, roots[1] + 0x8000), ==, 0x12345678);
+    qtest_qmp_assert_success(s, "{'execute':'qom-set','arguments':{"
+        "'path':'/machine/peripheral/vi/tunix-secondary',"
+        "'property':'tunix-fault-overflow','value':true}}");
+    g_assert_cmphex(qtest_readl(s, units[1] + DMAR_FSTS_REG) & VTD_FSTS_PFO, !=, 0);
+    g_assert_cmphex(qtest_readl(s, units[0] + DMAR_FSTS_REG), ==, 0);
+
+    /* The firmware bytes must describe the actual routing partition above. */
+    QFWCFG *fw = pc_fw_cfg_init(s);
+    size_t length = qfw_cfg_get_file(fw, "etc/acpi/tables", NULL, 0);
+    g_autofree uint8_t *tables = g_malloc(length);
+    g_assert_cmpuint(qfw_cfg_get_file(fw, "etc/acpi/tables", tables, length), ==, length);
+    bool found = false;
+    for (size_t i = 0; i + 96 <= length; i++) {
+        if (!memcmp(tables + i, "DMAR", 4)) {
+            const uint8_t *p = tables + i;
+            g_assert_cmpuint(ldl_le_p(p + 4), ==, 96);
+            g_assert_cmpuint(lduw_le_p(p + 50), ==, 24);
+            g_assert_cmphex(ldq_le_p(p + 56), ==, units[1]);
+            g_assert_cmpuint(p[64], ==, 2);
+            g_assert_cmpuint(p[70], ==, 3);
+            g_assert_cmpuint(p[71], ==, 0);
+            g_assert_cmpuint(p[76], ==, 1); /* Default INCLUDE_ALL */
+            g_assert_cmphex(ldq_le_p(p + 80), ==, units[0]);
+            g_assert_cmpuint(p[88], ==, 3); /* IOAPIC belongs only here. */
+            found = true;
+        }
+    }
+    g_assert_true(found);
+    pc_fw_cfg_uninit(fw);
+    qobject_unref(qtest_qmp(s, "{'execute':'system_reset'}"));
+    qtest_qmp_eventwait(s, "RESET");
+    for (unsigned i = 0; i < 2; i++) {
+        g_assert_cmphex(qtest_readl(s, units[i] + DMAR_GSTS_REG), ==, 0);
+        g_assert_cmphex(qtest_readl(s, units[i] + DMAR_FSTS_REG), ==, 0);
+    }
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -364,5 +515,6 @@ int main(int argc, char **argv)
     qtest_add_func("/q35/intel-iommu/tunix-edu-delay", test_tunix_edu_delay);
     qtest_add_func("/q35/intel-iommu/tunix-edu-posted", test_tunix_edu_posted);
     qtest_add_func("/q35/intel-iommu/tunix-fault-overflow", test_tunix_fault_overflow);
+    qtest_add_func("/q35/intel-iommu/tunix-split-engines", test_tunix_split_engines);
     return g_test_run();
 }

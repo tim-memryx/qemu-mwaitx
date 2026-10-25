@@ -33,3 +33,26 @@ It also checks held-doorbell visibility, real readback-triggered DMA, cancellati
 of the original posted timer, and failed readback with a later BME-blocked command.
 These fixtures model a missing retirement proof, not arbitrary PCIe fabric timing.
 Run with `QTEST_QEMU_BINARY` pointing at the corresponding built emulator.
+
+## Two-engine qualification topology
+
+On Q35, `-device intel-iommu,id=vi,intremap=on,tunix-split-devfn=24`
+creates a second, independent VT-d engine for the root port at `00:03.0`
+and its subtree. Create that port with `-device pcie-root-port,id=rp2,addr=3,chassis=2`.
+Specify the IOMMU before the PCI test devices. The default value, 256, retains
+upstream single-engine routing. Other values must name an existing root port on
+pcie.0. Routing follows bridge objects, including nested bridges; it does not
+infer ownership from firmware-assigned bus numbers.
+
+The secondary register aperture is 0xfed91000; its DMAR DRHD has an explicit
+subtree scope. The primary remains at 0xfed90000, with INCLUDE_ALL and sole
+IOAPIC ownership. Registers, translation/context/interrupt caches, invalidation
+queues and fault state belong to separate IntelIOMMUState objects. Secondary
+host controls are at `/machine/peripheral/vi/tunix-secondary`; primary controls
+remain at `/machine/peripheral/vi`.
+
+This bounded fixture rejects migration, host device assignment, scalable mode,
+ATS and PASID. Hotplug is not qualified. It is not a general multi-segment or
+physical-platform model. Both engines use the primary's capability options.
+The split-engine qtest checks independent real EDU DMA translations, MSI source
+faults, queue progress/stalling, overflow, reset, and the emitted DMAR scopes.

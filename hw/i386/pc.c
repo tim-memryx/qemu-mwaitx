@@ -1343,6 +1343,14 @@ static void pc_machine_device_pre_plug_cb(HotplugHandler *hotplug_dev,
         PCMachineState *pcms = PC_MACHINE(hotplug_dev);
 
         if (pcms->iommu) {
+            if (object_dynamic_cast(OBJECT(pcms->iommu), TYPE_INTEL_IOMMU_DEVICE) &&
+                object_dynamic_cast(OBJECT(dev), TYPE_INTEL_IOMMU_DEVICE)) {
+                IntelIOMMUState *parent = INTEL_IOMMU_DEVICE(pcms->iommu);
+                IntelIOMMUState *child = INTEL_IOMMU_DEVICE(dev);
+                if (child->tunix_secondary && parent->tunix_child == child) {
+                    return; /* Only the primary can construct its fixture child. */
+                }
+            }
             error_setg(errp, "QEMU does not support multiple vIOMMUs "
                        "for x86 yet.");
             return;

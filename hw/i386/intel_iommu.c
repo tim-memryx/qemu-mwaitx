@@ -41,7 +41,22 @@
 #include "hw/i386/apic_internal.h"
 #include "kvm/kvm_i386.h"
 #include "migration/vmstate.h"
+#include "migration/blocker.h"
 #include "trace.h"
+
+static IntelIOMMUState *vtd_tunix_unit(IntelIOMMUState *s, PCIBus *bus, int devfn)
+{
+    if (!s->tunix_child) {
+        return s;
+    }
+    /* Follow actual bridge ownership, not firmware-programmed bus-number ranges. */
+    while (!pci_bus_is_root(bus) && bus->parent_dev) {
+        devfn = bus->parent_dev->devfn;
+        bus = pci_get_bus(bus->parent_dev);
+    }
+    return bus == s->tunix_root_bus && devfn == s->tunix_split_devfn ?
+           s->tunix_child : s;
+}
 
 /*
  * Paging mode for first-stage translation (VTD spec Figure 9-6)
@@ -4185,6 +4200,7 @@ static const MemoryRegionOps vtd_mem_ops = {
 };
 
 static const Property vtd_properties[] = {
+    DEFINE_PROP_UINT16("tunix-split-devfn", IntelIOMMUState, tunix_split_devfn, 256),
     DEFINE_PROP_UINT32("version", IntelIOMMUState, version, 0),
     DEFINE_PROP_ON_OFF_AUTO("eim", IntelIOMMUState, intr_eim,
                             ON_OFF_AUTO_AUTO),
@@ -4771,6 +4787,12 @@ static bool vtd_dev_set_iommu_device(PCIBus *bus, void *opaque, int devfn,
 
     assert(hiod);
 
+    if (s->tunix_child || s->tunix_secondary) {
+        error_setg(errp, "The tunix split-engine fixture excludes "
+                   "host device assignment");
+        return false;
+    }
+
     if (!s->caching_mode) {
         error_setg(errp, "Device assignment is not allowed without enabling "
                    "caching-mode=on for Intel IOMMU.");
@@ -5210,7 +5232,7 @@ static void vtd_reset_exit(Object *obj, ResetType type)
 
 static AddressSpace *vtd_host_dma_iommu(PCIBus *bus, void *opaque, int devfn)
 {
-    IntelIOMMUState *s = opaque;
+    IntelIOMMUState *s = vtd_tunix_unit(opaque, bus, devfn);
     VTDAddressSpace *vtd_as;
 
     assert(0 <= devfn && devfn < PCI_DEVFN_MAX);
@@ -5259,7 +5281,7 @@ static ssize_t vtd_ats_request_translation(PCIBus *bus, void *opaque,
                                            size_t result_length,
                                            uint32_t *err_count)
 {
-    IntelIOMMUState *s = opaque;
+    IntelIOMMUState *s = vtd_tunix_unit(opaque, bus, devfn);
     VTDAddressSpace *vtd_as;
     IOMMUAccessFlags flags = IOMMU_ACCESS_FLAG_FULL(true, !no_write, exec_req,
                                                     priv_req, false, false);
@@ -5393,7 +5415,7 @@ static int vtd_pri_request_page(PCIBus *bus, void *opaque, int devfn,
                                 hwaddr addr, bool lpig, uint16_t prgi,
                                 bool is_read, bool is_write)
 {
-    IntelIOMMUState *s = opaque;
+    IntelIOMMUState *s = vtd_tunix_unit(opaque, bus, devfn);
     VTDAddressSpace *vtd_as;
 
     vtd_as = vtd_find_add_as(s, bus, devfn, pasid);
@@ -5501,7 +5523,7 @@ static void vtd_register_iotlb_notifier(PCIBus *bus, void *opaque,
                                         int devfn, uint32_t pasid,
                                         IOMMUNotifier *n)
 {
-    IntelIOMMUState *s = opaque;
+    IntelIOMMUState *s = vtd_tunix_unit(opaque, bus, devfn);
     VTDAddressSpace *vtd_as;
 
     vtd_as = vtd_find_add_as(s, bus, devfn, pasid);
@@ -5513,7 +5535,7 @@ static void vtd_unregister_iotlb_notifier(PCIBus *bus, void *opaque,
                                           int devfn, uint32_t pasid,
                                           IOMMUNotifier *n)
 {
-    IntelIOMMUState *s = opaque;
+    IntelIOMMUState *s = vtd_tunix_unit(opaque, bus, devfn);
     VTDAddressSpace *vtd_as;
 
     vtd_as = vtd_find_add_as(s, bus, devfn, pasid);
@@ -5523,7 +5545,7 @@ static void vtd_unregister_iotlb_notifier(PCIBus *bus, void *opaque,
 static void vtd_pri_register_notifier(PCIBus *bus, void *opaque, int devfn,
                                uint32_t pasid, IOMMUPRINotifier *notifier)
 {
-    IntelIOMMUState *s = opaque;
+    IntelIOMMUState *s = vtd_tunix_unit(opaque, bus, devfn);
     VTDAddressSpace *vtd_as;
 
     vtd_as = vtd_find_add_as(s, bus, devfn, pasid);
@@ -5533,7 +5555,7 @@ static void vtd_pri_register_notifier(PCIBus *bus, void *opaque, int devfn,
 static void vtd_pri_unregister_notifier(PCIBus *bus, void *opaque,
                                         int devfn, uint32_t pasid)
 {
-    IntelIOMMUState *s = opaque;
+    IntelIOMMUState *s = vtd_tunix_unit(opaque, bus, devfn);
     VTDAddressSpace *vtd_as;
 
     vtd_as = vtd_find_add_as(s, bus, devfn, pasid);
@@ -5633,6 +5655,18 @@ static bool vtd_decide_config(IntelIOMMUState *s, Error **errp)
     return true;
 }
 
+static void vtd_tunix_machine_done(Notifier *notifier, void *unused)
+{
+    IntelIOMMUState *s = container_of(notifier, IntelIOMMUState, tunix_machine_done);
+    PCIDevice *port = s->tunix_root_bus->devices[s->tunix_split_devfn];
+
+    if (!port || !pci_is_express(port) ||
+        pcie_cap_get_type(port) != PCI_EXP_TYPE_ROOT_PORT) {
+        error_report("tunix-split-devfn must name a root port on pcie.0");
+        exit(EXIT_FAILURE);
+    }
+}
+
 static void vtd_realize(DeviceState *dev, Error **errp)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
@@ -5640,6 +5674,15 @@ static void vtd_realize(DeviceState *dev, Error **errp)
     X86MachineState *x86ms = X86_MACHINE(ms);
     PCIBus *bus = pcms->pcibus;
     IntelIOMMUState *s = INTEL_IOMMU_DEVICE(dev);
+
+    if (s->tunix_split_devfn != 256 &&
+        (s->tunix_split_devfn > 255 || !s->tunix_split_devfn ||
+         s->tunix_secondary || s->scalable_mode || s->svm || s->pasid ||
+         s->x86_iommu.dt_supported || !s->x86_iommu.dma_translation)) {
+        error_setg(errp, "tunix-split-devfn requires a legacy DMA-remapping "
+                   "profile without ATS/PASID");
+        return;
+    }
 
     if (!vtd_decide_config(s, errp)) {
         return;
@@ -5650,6 +5693,7 @@ static void vtd_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->csrmem, OBJECT(s), &vtd_mem_ops, s,
                           "intel_iommu", DMAR_REG_SIZE);
     memory_region_add_subregion(get_system_memory(),
+                                s->tunix_secondary ? TUNIX_SECOND_IOMMU_ADDR :
                                 Q35_HOST_BRIDGE_IOMMU_ADDR, &s->csrmem);
 
     /* Create the shared memory regions by all devices */
@@ -5673,6 +5717,36 @@ static void vtd_realize(DeviceState *dev, Error **errp)
     s->vtd_host_iommu_dev = g_hash_table_new_full(vtd_hiod_hash, vtd_hiod_equal,
                                                   g_free, vtd_hiod_destroy);
     vtd_init(s);
+    s->tunix_root_bus = bus;
+    if (s->tunix_secondary) {
+        return; /* The parent routes PCI traffic; only it owns IOAPIC delivery. */
+    }
+    if (s->tunix_split_devfn != 256) {
+        DeviceState *child = qdev_new(TYPE_INTEL_IOMMU_DEVICE);
+        IntelIOMMUState *c = INTEL_IOMMU_DEVICE(child);
+
+        error_setg(&s->tunix_migration_blocker,
+                   "tunix split-engine topology is a non-migrating qualification fixture");
+        if (migrate_add_blocker(&s->tunix_migration_blocker, errp)) {
+            object_unref(OBJECT(child));
+            return;
+        }
+        s->tunix_child = c;
+        c->tunix_secondary = true;
+        c->aw_bits = s->aw_bits;
+        c->intr_eim = s->intr_eim;
+        c->caching_mode = s->caching_mode;
+        c->snoop_control = s->snoop_control;
+        c->x86_iommu.intr_supported = s->x86_iommu.intr_supported;
+        object_property_add_child(OBJECT(s), "tunix-secondary", OBJECT(c));
+        if (!sysbus_realize(SYS_BUS_DEVICE(child), errp)) {
+            object_unref(OBJECT(child));
+            return;
+        }
+        object_unref(OBJECT(child));
+        s->tunix_machine_done.notify = vtd_tunix_machine_done;
+        qemu_add_machine_init_done_notifier(&s->tunix_machine_done);
+    }
     pci_setup_iommu(bus, &vtd_iommu_ops, dev);
     /* Pseudo address space under root PCI bus. */
     x86ms->ioapic_as = vtd_host_dma_iommu(bus, s, Q35_PSEUDO_DEVFN_IOAPIC);

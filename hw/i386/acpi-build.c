@@ -1673,13 +1673,30 @@ build_dmar_q35(GArray *table_data, BIOSLinker *linker, const char *oem_id,
     build_append_int_noprefix(table_data, dmar_flags, 1); /* Flags */
     g_array_append_vals(table_data, rsvd10, sizeof(rsvd10)); /* Reserved */
 
+    if (intel_iommu->tunix_child) {
+        /* Exact subtree first; the default unit below covers all other sources. */
+        build_append_int_noprefix(table_data, 0, 2);
+        build_append_int_noprefix(table_data, 24, 2);
+        build_append_int_noprefix(table_data, 0, 4); /* Flags, reserved, segment */
+        build_append_int_noprefix(table_data,
+                                  TUNIX_SECOND_IOMMU_ADDR, 8);
+        build_append_int_noprefix(table_data, 2, 1); /* PCI subtree */
+        build_append_int_noprefix(table_data, 8, 1);
+        build_append_int_noprefix(table_data, 0, 4); /* Reserved, enum ID, bus 0 */
+        build_append_int_noprefix(table_data,
+                                  PCI_SLOT(intel_iommu->tunix_split_devfn), 1);
+        build_append_int_noprefix(table_data,
+                                  PCI_FUNC(intel_iommu->tunix_split_devfn), 1);
+        g_array_set_size(scope_blob, 0); /* INCLUDE_ALL supplies the remainder. */
+    }
+
     /* 8.3 DMAR Remapping Hardware Unit Definition structure */
     build_append_int_noprefix(table_data, 0, 2); /* Type */
     /* Length */
     build_append_int_noprefix(table_data,
                               16 + ioapic_scope_size + scope_blob->len, 2);
     /* Flags */
-    build_append_int_noprefix(table_data, 0 /* Don't include all pci device */ ,
+    build_append_int_noprefix(table_data, intel_iommu->tunix_child ? 1 : 0,
                               1);
     build_append_int_noprefix(table_data, 0 , 1); /* Reserved */
     build_append_int_noprefix(table_data, 0 , 2); /* Segment Number */
