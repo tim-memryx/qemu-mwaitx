@@ -16,6 +16,9 @@ The fixtures are mutable QOM properties, intended only for non-migrating tests:
 | edu / `tunix-dma-delay-ms` | 100 | Delay for the next DMA timer, clamped to 60,000 ms. Changing it does not reschedule an already-issued command. |
 | edu / `tunix-dma-completions` | 0, read-only | Actual DMA timer callbacks that retire a RUN command. |
 | edu / `tunix-dma-failures` | 0, read-only | PCI DMA transactions returning a result other than MEMTX_OK. |
+| edu / `tunix-posted-delay-ms` | 0 | One-shot delay of the next idle DMA RUN doorbell and its captured payload, clamped to 60,000 ms. RUN still reads idle until the identity read flushes it or the timer expires. Resets itself to zero when consumed. |
+| edu / `tunix-posted-flushes` | 0, read-only | Pending doorbells actually flushed by an identity-register read. |
+| edu / `tunix-readback-failure` | 0 | Nonzero makes identity reads return all ones without flushing a held doorbell. |
 
 Fixture controls/counters are not migration state. No guest register programs
 them. Normal EDU behavior retains its upstream 100-ms delay. Disabling PCI bus
@@ -25,4 +28,7 @@ IOMMU fault. EDU has no qualified FLR; Tunix tests idle/sanitization or quaranti
 
 `tests/qtest/intel-iommu-test` covers compatibility/CFIS/EIME/SID behavior, stalled
 and resumed queued completion, delayed DMA data, and rejection after BME removal.
+It also checks held-doorbell visibility, real readback-triggered DMA, cancellation
+of the original posted timer, and failed readback with a later BME-blocked command.
+These fixtures model a missing retirement proof, not arbitrary PCIe fabric timing.
 Run with `QTEST_QEMU_BINARY` pointing at the corresponding built emulator.

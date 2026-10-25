@@ -274,6 +274,70 @@ static void test_tunix_edu_delay(void)
     qtest_quit(s);
 }
 
+static void test_tunix_edu_posted(void)
+{
+    QTestState *s;
+    QDict *result;
+    const uint64_t source = 0x300000, destination = 0x301000;
+
+    if (!qtest_has_device("edu")) {
+        g_test_skip("EDU device not available");
+        return;
+    }
+    s = qtest_init("-M q35 -device edu,id=edu,addr=4 -nodefaults");
+    edu_config_write(s, 0x10, EDU_BAR);
+    edu_config_write(s, 4, 0x406);
+    qtest_writel(s, source, 0xdecafbad);
+    qtest_qmp_assert_success(s, "{'execute':'qom-set','arguments':{"
+                            "'path':'/machine/peripheral/edu',"
+                            "'property':'tunix-posted-delay-ms','value':5000}}");
+    qtest_writeq(s, EDU_BAR + 0x80, source);
+    qtest_writeq(s, EDU_BAR + 0x88, 0x40000);
+    qtest_writeq(s, EDU_BAR + 0x90, 4);
+    qtest_writeq(s, EDU_BAR + 0x98, 1);
+    qtest_clock_step(s, 4999000000ULL);
+    g_assert_cmphex(qtest_readq(s, EDU_BAR + 0x98), ==, 0);
+    g_assert_cmphex(qtest_readl(s, EDU_BAR), ==, 0x010000ed);
+    g_assert_cmphex(qtest_readq(s, EDU_BAR + 0x98) & 1, ==, 1);
+    qtest_clock_step(s, 100000000);
+    g_assert_cmphex(qtest_readq(s, EDU_BAR + 0x98) & 1, ==, 0);
+    qtest_writeq(s, EDU_BAR + 0x80, 0x40000);
+    qtest_writeq(s, EDU_BAR + 0x88, destination);
+    qtest_writeq(s, EDU_BAR + 0x98, 3);
+    qtest_clock_step(s, 100000000);
+    g_assert_cmphex(qtest_readl(s, destination), ==, 0xdecafbad);
+    qtest_qmp_assert_success(s, "{'execute':'qom-set','arguments':{"
+                            "'path':'/machine/peripheral/edu',"
+                            "'property':'tunix-posted-delay-ms','value':5000}}");
+    qtest_qmp_assert_success(s, "{'execute':'qom-set','arguments':{"
+                            "'path':'/machine/peripheral/edu',"
+                            "'property':'tunix-readback-failure','value':1}}");
+    qtest_writel(s, destination, 0xfeedface);
+    qtest_writeq(s, EDU_BAR + 0x98, 3);
+    g_assert_cmphex(qtest_readq(s, EDU_BAR + 0x98) & 1, ==, 0);
+    g_assert_cmphex(qtest_readl(s, EDU_BAR), ==, 0xffffffff);
+    edu_config_write(s, 4, 0x402);
+    qtest_clock_step(s, 5000000000ULL);
+    qtest_clock_step(s, 100000000);
+    g_assert_cmphex(qtest_readl(s, destination), ==, 0xfeedface);
+    result = qtest_qmp(s,
+        "{'execute':'qom-get','arguments':{'path':'/machine/peripheral/edu',"
+        "'property':'tunix-posted-flushes'}}");
+    g_assert_cmpint(qdict_get_int(result, "return"), ==, 1);
+    qobject_unref(result);
+    result = qtest_qmp(s,
+        "{'execute':'qom-get','arguments':{'path':'/machine/peripheral/edu',"
+        "'property':'tunix-dma-completions'}}");
+    g_assert_cmpint(qdict_get_int(result, "return"), ==, 3);
+    qobject_unref(result);
+    result = qtest_qmp(s,
+        "{'execute':'qom-get','arguments':{'path':'/machine/peripheral/edu',"
+        "'property':'tunix-dma-failures'}}");
+    g_assert_cmpint(qdict_get_int(result, "return"), ==, 1);
+    qobject_unref(result);
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -285,5 +349,6 @@ int main(int argc, char **argv)
                    test_intel_iommu_compat_interrupt);
     qtest_add_func("/q35/intel-iommu/tunix-qi-stall", test_tunix_qi_stall);
     qtest_add_func("/q35/intel-iommu/tunix-edu-delay", test_tunix_edu_delay);
+    qtest_add_func("/q35/intel-iommu/tunix-edu-posted", test_tunix_edu_posted);
     return g_test_run();
 }
