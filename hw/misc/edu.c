@@ -77,6 +77,10 @@ struct EduState {
     uint64_t dma_mask;
     uint64_t tunix_dma_completions, tunix_dma_failures;
     uint64_t tunix_dma_delay_ms; /* Host-controlled retirement test fixture. */
+    QEMUTimer tunix_posted_timer;
+    struct dma_state tunix_posted;
+    bool tunix_posted_pending;
+    uint64_t tunix_posted_delay_ms, tunix_posted_flushes, tunix_readback_failure;
 };
 
 static bool edu_msi_enabled(EduState *edu)
@@ -200,6 +204,21 @@ static void dma_rw(EduState *edu, bool write, dma_addr_t *val, dma_addr_t *dma,
     }
 }
 
+static void edu_commit_posted(void *opaque)
+{
+    EduState *edu = opaque;
+
+    if (!edu->tunix_posted_pending) {
+        return;
+    }
+    edu->tunix_posted_pending = false;
+    timer_del(&edu->tunix_posted_timer);
+    edu->dma.src = edu->tunix_posted.src;
+    edu->dma.dst = edu->tunix_posted.dst;
+    edu->dma.cnt = edu->tunix_posted.cnt;
+    dma_rw(edu, true, &edu->tunix_posted.cmd, &edu->dma.cmd, true);
+}
+
 static uint64_t edu_mmio_read(void *opaque, hwaddr addr, unsigned size)
 {
     EduState *edu = opaque;
@@ -215,6 +234,13 @@ static uint64_t edu_mmio_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (addr) {
     case 0x00:
+        if (edu->tunix_readback_failure) {
+            break; /* Missing readback cannot certify posted-write retirement. */
+        }
+        if (edu->tunix_posted_pending) {
+            edu->tunix_posted_flushes++;
+            edu_commit_posted(edu);
+        }
         val = 0x010000edu;
         break;
     case 0x04:
@@ -306,6 +332,21 @@ static void edu_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         if (!(val & EDU_DMA_RUN)) {
             break;
         }
+        if (edu->tunix_posted_delay_ms && !edu->tunix_posted_pending &&
+            !(edu->dma.cmd & EDU_DMA_RUN)) {
+            /* One-shot host fixture: hold one doorbell and its payload while
+             * RUN still reads idle. The identity read drains this posted write;
+             * status polling alone does not. Ordinary EDU behavior is default.
+             */
+            edu->tunix_posted = edu->dma;
+            edu->tunix_posted.cmd = val;
+            edu->tunix_posted_pending = true;
+            timer_mod(&edu->tunix_posted_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                      MIN(edu->tunix_posted_delay_ms, 60000));
+            edu->tunix_posted_delay_ms = 0;
+            break;
+        }
         dma_rw(edu, true, &val, &edu->dma.cmd, true);
         break;
     }
@@ -390,6 +431,8 @@ static void pci_edu_realize(PCIDevice *pdev, Error **errp)
     }
 
     timer_init_ms(&edu->dma_timer, QEMU_CLOCK_VIRTUAL, edu_dma_timer, edu);
+    timer_init_ms(&edu->tunix_posted_timer, QEMU_CLOCK_VIRTUAL,
+                  edu_commit_posted, edu);
 
     qemu_mutex_init(&edu->thr_mutex);
     qemu_cond_init(&edu->thr_cond);
@@ -415,6 +458,7 @@ static void pci_edu_uninit(PCIDevice *pdev)
     qemu_mutex_destroy(&edu->thr_mutex);
 
     timer_del(&edu->dma_timer);
+    timer_del(&edu->tunix_posted_timer);
     msi_uninit(pdev);
 }
 
@@ -422,6 +466,14 @@ static void edu_instance_init(Object *obj)
 {
     EduState *edu = EDU(obj);
 
+    object_property_add_uint64_ptr(obj, "tunix-posted-delay-ms",
+                                   &edu->tunix_posted_delay_ms,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint64_ptr(obj, "tunix-posted-flushes",
+                                   &edu->tunix_posted_flushes, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "tunix-readback-failure",
+                                   &edu->tunix_readback_failure,
+                                   OBJ_PROP_FLAG_READWRITE);
     object_property_add_uint64_ptr(obj, "tunix-dma-completions",
                                    &edu->tunix_dma_completions,
                                    OBJ_PROP_FLAG_READ);
