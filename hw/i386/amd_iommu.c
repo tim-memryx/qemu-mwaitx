@@ -25,6 +25,9 @@
 #include "hw/pci/msi.h"
 #include "hw/pci/pci_bus.h"
 #include "migration/vmstate.h"
+#include "migration/blocker.h"
+#include "system/system.h"
+#include "hw/pci/pcie.h"
 #include "amd_iommu.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -36,10 +39,27 @@
 #include "qemu/iova-tree.h"
 #include "hw/core/registerfields.h"
 
+AMDVIState *amdvi_unit_for_device(AMDVIState *s, PCIBus *bus, int devfn)
+{
+    if (!s->tunix_child) {
+        return s;
+    }
+    if (s->iommu.tunix_secondary_segment) {
+        return s; /* Separate root uses its own engine's PCIIOMMUOps. */
+    }
+    /* Route by bridge ownership, even before firmware assigns bus numbers. */
+    while (!pci_bus_is_root(bus) && bus->parent_dev) {
+        devfn = bus->parent_dev->devfn;
+        bus = pci_get_bus(bus->parent_dev);
+    }
+    return bus == s->tunix_root_bus && devfn == s->tunix_split_devfn ?
+           s->tunix_child : s;
+}
+
 struct AMDVIAddressSpace {
     PCIBus *bus;                /* PCIBus (for bus number)              */
     uint8_t devfn;              /* device function                      */
-    AMDVIState *iommu_state;    /* AMDVI - one per machine              */
+    AMDVIState *iommu_state;    /* AMDVI engine owning this requester              */
     MemoryRegion root;          /* AMDVI Root memory map region         */
     IOMMUMemoryRegion iommu;    /* Device's address translation region  */
     MemoryRegion iommu_nodma;   /* Alias of shared nodma memory region  */
@@ -2461,7 +2481,7 @@ static const MemoryRegionOps amdvi_ir_ops = {
 static AddressSpace *amdvi_host_dma_iommu(PCIBus *bus, void *opaque, int devfn)
 {
     char name[128];
-    AMDVIState *s = opaque;
+    AMDVIState *s = amdvi_unit_for_device(opaque, bus, devfn);
     AMDVIAddressSpace *amdvi_dev_as;
     AMDVIAsKey *key;
 
@@ -2555,6 +2575,11 @@ static int amdvi_iommu_notify_flag_changed(IOMMUMemoryRegion *iommu,
 {
     AMDVIAddressSpace *as = container_of(iommu, AMDVIAddressSpace, iommu);
     AMDVIState *s = as->iommu_state;
+
+    if (s->tunix_child || s->tunix_secondary) {
+        error_setg(errp, "tunix split-engine fixture excludes host assignment");
+        return -ENOTSUP;
+    }
 
     /*
      * Accurate synchronization of the vIOMMU page tables required to support
@@ -2730,6 +2755,20 @@ static const VMStateDescription vmstate_amdvi_sysbus_migratable = {
      }
 };
 
+static void amdvi_tunix_machine_done(Notifier *notifier, void *unused)
+{
+    AMDVIState *s = container_of(notifier, AMDVIState, tunix_machine_done);
+    PCIBus *root = s->iommu.tunix_segment_bus ?
+                   s->iommu.tunix_segment_bus : s->tunix_root_bus;
+    PCIDevice *port = root->devices[s->tunix_split_devfn];
+
+    if (!port || !pci_is_express(port) ||
+        pcie_cap_get_type(port) != PCI_EXP_TYPE_ROOT_PORT) {
+        error_report("tunix-split-devfn must name a root port on pcie.0");
+        exit(EXIT_FAILURE);
+    }
+}
+
 static void amdvi_sysbus_realize(DeviceState *dev, Error **errp)
 {
     DeviceClass *dc = (DeviceClass *) object_get_class(OBJECT(dev));
@@ -2737,7 +2776,24 @@ static void amdvi_sysbus_realize(DeviceState *dev, Error **errp)
     MachineState *ms = MACHINE(qdev_get_machine());
     PCMachineState *pcms = PC_MACHINE(ms);
     X86MachineState *x86ms = X86_MACHINE(ms);
-    PCIBus *bus = pcms->pcibus;
+    PCIBus *bus = s->tunix_secondary && s->iommu.tunix_segment_bus ?
+                  s->iommu.tunix_segment_bus : pcms->pcibus;
+
+    if (s->iommu.tunix_secondary_segment &&
+        (s->tunix_split_devfn == 256 || s->tunix_secondary)) {
+        error_setg(errp, "tunix-secondary-segment requires a primary split-engine fixture");
+        return;
+    }
+    if (s->tunix_split_devfn != 256 &&
+        (s->tunix_split_devfn > 255 || !s->tunix_split_devfn ||
+         s->tunix_secondary || s->pci_id || !s->dma_remap ||
+         !s->iommu.dma_translation || s->iommu.dt_supported)) {
+        error_setg(errp, "tunix-split-devfn requires DMA remapping without "
+                   "device IOTLB or external PCI identity");
+        return;
+    }
+    s->tunix_root_bus = bus;
+    s->mmio_addr = AMDVI_BASE_ADDR + (s->tunix_secondary ? AMDVI_MMIO_SIZE : 0);
 
     if (s->pci_id) {
         PCIDevice *pdev = NULL;
@@ -2757,11 +2813,22 @@ static void amdvi_sysbus_realize(DeviceState *dev, Error **errp)
         dc->vmsd = &vmstate_amdvi_sysbus_migratable;
     } else {
         s->pci = AMD_IOMMU_PCI(object_new(TYPE_AMD_IOMMU_PCI));
+        /* Keep fixture identities clear of the selected root ports. */
+        if (s->tunix_secondary || s->tunix_split_devfn != 256) {
+            object_property_set_int(OBJECT(s->pci), "addr",
+                                    PCI_DEVFN(s->tunix_secondary ? 0x13 : 0x12, 0),
+                                    &error_abort);
+        }
         /* This device should take care of IOMMU PCI properties */
         if (!qdev_realize(DEVICE(s->pci), &bus->qbus, errp)) {
             return;
         }
     }
+
+    pci_set_long(s->pci->dev.config + s->pci->capab_offset + AMDVI_CAPAB_BAR_LOW,
+                 s->mmio_addr & MAKE_64BIT_MASK(14, 18));
+    pci_set_long(s->pci->dev.config + s->pci->capab_offset + AMDVI_CAPAB_BAR_HIGH,
+                 s->mmio_addr >> 32);
 
     s->iotlb = g_hash_table_new_full(amdvi_iotlb_hash,
                                      amdvi_iotlb_equal, g_free, g_free);
@@ -2772,7 +2839,7 @@ static void amdvi_sysbus_realize(DeviceState *dev, Error **errp)
     /* set up MMIO */
     memory_region_init_io(&s->mr_mmio, OBJECT(s), &mmio_mem_ops, s,
                           "amdvi-mmio", AMDVI_MMIO_SIZE);
-    memory_region_add_subregion(get_system_memory(), AMDVI_BASE_ADDR,
+    memory_region_add_subregion(get_system_memory(), s->mmio_addr,
                                 &s->mr_mmio);
 
     /* Create the share memory regions by all devices */
@@ -2791,7 +2858,46 @@ static void amdvi_sysbus_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion_overlap(&s->mr_sys, AMDVI_INT_ADDR_FIRST,
                                         &s->mr_ir, 1);
 
-    /* Pseudo address space under root PCI bus. */
+    amdvi_init(s);
+    if (s->tunix_secondary) {
+        return; /* Parent owns bus routing and the sole IOAPIC source. */
+    }
+    if (s->tunix_split_devfn != 256) {
+        DeviceState *child = qdev_new(TYPE_AMD_IOMMU_DEVICE);
+        AMDVIState *c = AMD_IOMMU_DEVICE(child);
+
+        error_setg(&s->tunix_migration_blocker,
+                   "tunix split-engine topology is a non-migrating qualification fixture");
+        if (migrate_add_blocker(&s->tunix_migration_blocker, errp)) {
+            object_unref(OBJECT(child));
+            return;
+        }
+        if (s->iommu.tunix_secondary_segment) {
+            c->iommu.tunix_segment_bus = x86_iommu_create_tunix_segment(&s->iommu, errp);
+            if (!c->iommu.tunix_segment_bus) {
+                object_unref(OBJECT(child));
+                return;
+            }
+        }
+        s->tunix_child = c;
+        c->tunix_secondary = true;
+        c->xtsup = s->xtsup;
+        c->dma_remap = s->dma_remap;
+        c->iommu.intr_supported = s->iommu.intr_supported;
+        object_property_add_child(OBJECT(s), "tunix-secondary", OBJECT(c));
+        if (!sysbus_realize(SYS_BUS_DEVICE(child), errp)) {
+            object_unref(OBJECT(child));
+            return;
+        }
+        object_unref(OBJECT(child));
+        if (s->iommu.tunix_segment_bus) {
+            pci_setup_iommu(s->iommu.tunix_segment_bus,
+                            &amdvi_iommu_ops, c);
+        }
+        s->tunix_machine_done.notify = amdvi_tunix_machine_done;
+        qemu_add_machine_init_done_notifier(&s->tunix_machine_done);
+    }
+    /* Pseudo address space under root PCI bus, owned only by the primary. */
     x86ms->ioapic_as = amdvi_host_dma_iommu(bus, s, AMDVI_IOAPIC_SB_DEVID);
 
     if (kvm_enabled() && x86ms->apic_id_limit > 255 && !s->xtsup) {
@@ -2808,10 +2914,11 @@ static void amdvi_sysbus_realize(DeviceState *dev, Error **errp)
     }
 
     pci_setup_iommu(bus, &amdvi_iommu_ops, s);
-    amdvi_init(s);
 }
 
 static const Property amdvi_properties[] = {
+    DEFINE_PROP_UINT16("tunix-split-devfn", AMDVIState, tunix_split_devfn, 256),
+    DEFINE_PROP_BOOL("tunix-secondary-segment", AMDVIState, iommu.tunix_secondary_segment, false),
     DEFINE_PROP_BOOL("xtsup", AMDVIState, xtsup, false),
     DEFINE_PROP_STRING("pci-id", AMDVIState, pci_id),
     DEFINE_PROP_BOOL("dma-remap", AMDVIState, dma_remap, false),

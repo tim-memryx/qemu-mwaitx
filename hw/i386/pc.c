@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "amd_iommu.h"
 #include "qemu/units.h"
 #include "exec/target_page.h"
 #include "hw/i386/pc.h"
@@ -1349,6 +1350,14 @@ static void pc_machine_device_pre_plug_cb(HotplugHandler *hotplug_dev,
                 IntelIOMMUState *child = INTEL_IOMMU_DEVICE(dev);
                 if (child->tunix_secondary && parent->tunix_child == child) {
                     return; /* Only the primary can construct its fixture child. */
+                }
+            }
+            if (object_dynamic_cast(OBJECT(pcms->iommu), TYPE_AMD_IOMMU_DEVICE) &&
+                object_dynamic_cast(OBJECT(dev), TYPE_AMD_IOMMU_DEVICE)) {
+                AMDVIState *parent = AMD_IOMMU_DEVICE(pcms->iommu);
+                AMDVIState *child = AMD_IOMMU_DEVICE(dev);
+                if (child->tunix_secondary && parent->tunix_child == child) {
+                    return; /* A fixture child cannot replace the default unit. */
                 }
             }
             error_setg(errp, "QEMU does not support multiple vIOMMUs "

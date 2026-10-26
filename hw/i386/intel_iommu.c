@@ -49,6 +49,9 @@ static IntelIOMMUState *vtd_tunix_unit(IntelIOMMUState *s, PCIBus *bus, int devf
     if (!s->tunix_child) {
         return s;
     }
+    if (s->x86_iommu.tunix_secondary_segment) {
+        return s; /* Separate root uses its own engine's PCIIOMMUOps. */
+    }
     /* Follow actual bridge ownership, not firmware-programmed bus-number ranges. */
     while (!pci_bus_is_root(bus) && bus->parent_dev) {
         devfn = bus->parent_dev->devfn;
@@ -4201,6 +4204,7 @@ static const MemoryRegionOps vtd_mem_ops = {
 
 static const Property vtd_properties[] = {
     DEFINE_PROP_UINT16("tunix-split-devfn", IntelIOMMUState, tunix_split_devfn, 256),
+    DEFINE_PROP_BOOL("tunix-secondary-segment", IntelIOMMUState, x86_iommu.tunix_secondary_segment, false),
     DEFINE_PROP_UINT32("version", IntelIOMMUState, version, 0),
     DEFINE_PROP_ON_OFF_AUTO("eim", IntelIOMMUState, intr_eim,
                             ON_OFF_AUTO_AUTO),
@@ -5658,7 +5662,9 @@ static bool vtd_decide_config(IntelIOMMUState *s, Error **errp)
 static void vtd_tunix_machine_done(Notifier *notifier, void *unused)
 {
     IntelIOMMUState *s = container_of(notifier, IntelIOMMUState, tunix_machine_done);
-    PCIDevice *port = s->tunix_root_bus->devices[s->tunix_split_devfn];
+    PCIBus *root = s->x86_iommu.tunix_segment_bus ?
+                   s->x86_iommu.tunix_segment_bus : s->tunix_root_bus;
+    PCIDevice *port = root->devices[s->tunix_split_devfn];
 
     if (!port || !pci_is_express(port) ||
         pcie_cap_get_type(port) != PCI_EXP_TYPE_ROOT_PORT) {
@@ -5675,6 +5681,11 @@ static void vtd_realize(DeviceState *dev, Error **errp)
     PCIBus *bus = pcms->pcibus;
     IntelIOMMUState *s = INTEL_IOMMU_DEVICE(dev);
 
+    if (s->x86_iommu.tunix_secondary_segment &&
+        (s->tunix_split_devfn == 256 || s->tunix_secondary)) {
+        error_setg(errp, "tunix-secondary-segment requires a primary split-engine fixture");
+        return;
+    }
     if (s->tunix_split_devfn != 256 &&
         (s->tunix_split_devfn > 255 || !s->tunix_split_devfn ||
          s->tunix_secondary || s->scalable_mode || s->svm || s->pasid ||
@@ -5731,6 +5742,13 @@ static void vtd_realize(DeviceState *dev, Error **errp)
             object_unref(OBJECT(child));
             return;
         }
+        if (s->x86_iommu.tunix_secondary_segment) {
+            c->x86_iommu.tunix_segment_bus = x86_iommu_create_tunix_segment(&s->x86_iommu, errp);
+            if (!c->x86_iommu.tunix_segment_bus) {
+                object_unref(OBJECT(child));
+                return;
+            }
+        }
         s->tunix_child = c;
         c->tunix_secondary = true;
         c->aw_bits = s->aw_bits;
@@ -5744,6 +5762,10 @@ static void vtd_realize(DeviceState *dev, Error **errp)
             return;
         }
         object_unref(OBJECT(child));
+        if (s->x86_iommu.tunix_segment_bus) {
+            pci_setup_iommu(s->x86_iommu.tunix_segment_bus,
+                            &vtd_iommu_ops, c);
+        }
         s->tunix_machine_done.notify = vtd_tunix_machine_done;
         qemu_add_machine_init_done_notifier(&s->tunix_machine_done);
     }

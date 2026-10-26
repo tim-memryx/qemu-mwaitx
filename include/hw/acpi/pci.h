@@ -34,6 +34,11 @@ typedef struct AcpiMcfgInfo {
     uint32_t size;
 } AcpiMcfgInfo;
 
+/* Each array entry describes one distinct segment, numbered by its index. */
+void build_mcfg_segments(GArray *table_data, BIOSLinker *linker,
+                         AcpiMcfgInfo *info, size_t count,
+                         const char *oem_id, const char *oem_table_id);
+
 void build_mcfg(GArray *table_data, BIOSLinker *linker, AcpiMcfgInfo *info,
                 const char *oem_id, const char *oem_table_id);
 

@@ -26,6 +26,70 @@
 #include "qemu/error-report.h"
 #include "trace.h"
 #include "system/kvm.h"
+#include "hw/pci/pcie_host.h"
+#include "hw/pci/pci_bus.h"
+
+/* Independent root and ECAM decoder. It is deliberately absent from CF8 and
+ * the primary root's bus tree, so equal BDFs cannot alias across segments. */
+#define TYPE_TUNIX_SEGMENT "tunix-pcie-segment"
+
+static void tunix_segment_irq(void *opaque, int irq, int level)
+{
+    if (level) {
+        error_report("tunix segment fixture supports remapped MSI only");
+        exit(EXIT_FAILURE);
+    }
+}
+
+static int tunix_segment_swizzle(PCIDevice *dev, int pin)
+{
+    return (PCI_SLOT(dev->devfn) + pin) % 4;
+}
+
+static void tunix_segment_realize(DeviceState *dev, Error **errp)
+{
+    PCIExpressHost *host = PCIE_HOST_BRIDGE(dev);
+    host->pci.bus = pci_register_root_bus(dev, "tunix-pcie.1", tunix_segment_irq,
+                                          tunix_segment_swizzle, NULL,
+                                          get_system_memory(), get_system_io(),
+                                          0, 4, TYPE_PCIE_BUS);
+    pcie_host_mmcfg_map(host, TUNIX_SEGMENT_ECAM, TUNIX_SEGMENT_ECAM_SIZE);
+}
+
+static void tunix_segment_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    dc->realize = tunix_segment_realize;
+    dc->user_creatable = false;
+    dc->hotpluggable = false;
+}
+
+static const TypeInfo tunix_segment_type = {
+    .name = TYPE_TUNIX_SEGMENT,
+    .parent = TYPE_PCIE_HOST_BRIDGE,
+    .instance_size = sizeof(PCIExpressHost),
+    .class_init = tunix_segment_class_init,
+};
+
+PCIBus *x86_iommu_create_tunix_segment(X86IOMMUState *s, Error **errp)
+{
+    MachineState *ms = MACHINE(qdev_get_machine());
+    if (ms->ram_size > (1ULL << 30)) {
+        error_setg(errp, "tunix two-segment fixture requires at most 1 GiB RAM");
+        return NULL;
+    }
+    DeviceState *dev = qdev_new(TYPE_TUNIX_SEGMENT);
+    object_property_add_child(OBJECT(s), "tunix-segment", OBJECT(dev));
+    if (!sysbus_realize(SYS_BUS_DEVICE(dev), errp)) {
+        object_unref(OBJECT(dev));
+        return NULL;
+    }
+    s->tunix_segment_bus = PCI_HOST_BRIDGE(dev)->bus;
+    /* ECAM is outside RAM and reserved by MCFG. */
+    /* The secondary root exclusively owns its MMIO window. */
+    object_unref(OBJECT(dev));
+    return s->tunix_segment_bus;
+}
 
 void x86_iommu_iec_register_notifier(X86IOMMUState *iommu,
                                      iec_notify_fn fn, void *data)
@@ -155,6 +219,7 @@ static const TypeInfo x86_iommu_info = {
 
 static void x86_iommu_register_types(void)
 {
+    type_register_static(&tunix_segment_type);
     type_register_static(&x86_iommu_info);
 }
 

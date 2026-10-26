@@ -260,9 +260,100 @@ static void test_host_controls(void)
     qtest_quit(s);
 }
 
+/* Both engines see the same IOVAs, but must use independent tables/caches and
+ * completion streams. A stopped secondary queue cannot stall primary work. */
+static void test_split_engines(gconstpointer data)
+{
+    bool segments = GPOINTER_TO_INT(data);
+    g_autofree char *args = g_strdup_printf("-M q35 -nodefaults "
+        "-device amd-iommu,id=vi,dma-remap=on,intremap=on,tunix-split-devfn=24%s "
+        "-device pcie-root-port,id=rp1,bus=pcie.0,addr=2,chassis=1 "
+        "-device edu,id=edu0,bus=rp1,addr=0 "
+        "-device pcie-root-port,id=rp2,bus=%s,addr=3,chassis=2 "
+        "-device edu,id=edu1,bus=rp2,addr=0",
+        segments ? ",tunix-secondary-segment=on" : "",
+        segments ? "tunix-pcie.1" : "pcie.0");
+    QTestState *s = qtest_init(args);
+    for (unsigned u = 0; u < 2; ++u) {
+        uint64_t base = AMDVI_BASE_ADDR + u * AMDVI_MMIO_SIZE;
+        unsigned rid = (segments ? 1 : u + 1) << 8;
+        uint64_t bar = TEST_BAR + u * 0x100000;
+        uint64_t dt = TEST_DT + u * 0x100000;
+        uint64_t pt = TEST_PT + u * 4096;
+        uint64_t input = 0x620000 + u * 0x2000;
+        uint64_t output = input + 4096;
+        unsigned port = (u + 2) << 3;
+        if (segments && u) {
+            /* Equal requester IDs decoded through distinct host ECAM roots. */
+            uint64_t ecam = 0x50000000;
+            qtest_writel(s, ecam + (port << 12) + 0x18, 0x00010100);
+            qtest_writel(s, ecam + (port << 12) + 0x20, bar | (bar >> 16));
+            qtest_writew(s, ecam + (port << 12) + 4, 6);
+            qtest_writel(s, ecam + (rid << 12) + 0x10, bar);
+            qtest_writew(s, ecam + (rid << 12) + 4, 0x406);
+        } else {
+            config_write(s, port, 0x18, (rid << 8) | rid);
+            config_write(s, port, 0x20, bar | (bar >> 16));
+            config_write(s, port, 4, 6);
+            config_write(s, rid, 0x10, bar);
+            config_write(s, rid, 4, 0x406);
+        }
+        g_assert_cmphex(qtest_readl(s, bar), ==, 0x010000ed);
+        qtest_writeq(s, dt + rid * 32, pt | (3ULL << 61) | (1 << 9) | 3);
+        qtest_writeq(s, dt + rid * 32 + 8, 7 + u);
+        qtest_writeq(s, pt + 8, input | (3ULL << 61) | 1);
+        qtest_writeq(s, pt + 16, output | (3ULL << 61) | 1);
+        qtest_writeb(s, input, 0x41 + u);
+        qtest_writeq(s, base + AMDVI_MMIO_DEVICE_TABLE, dt | 511);
+        qtest_writeq(s, base + AMDVI_MMIO_COMMAND_BASE,
+                     (CMDBUF_ADDR + u * 4096) | (8ULL << 56));
+        qtest_writeq(s, base + AMDVI_MMIO_CONTROL,
+                     AMDVI_MMIO_CONTROL_AMDVIEN | AMDVI_MMIO_CONTROL_CMDBUFLEN);
+        /* Publish the DTE through the real invalidation command before DMA. */
+        qtest_writeq(s, CMDBUF_ADDR + u * 4096, (2ULL << 60) | rid);
+        qtest_writeq(s, base + AMDVI_MMIO_COMMAND_TAIL, 16);
+        g_assert_cmphex(qtest_readq(s, base + AMDVI_MMIO_COMMAND_HEAD), ==, 16);
+        for (unsigned write = 0; write < 2; ++write) {
+            qtest_writeq(s, bar + 0x80, write ? 0x40000 : 0x1000);
+            qtest_writeq(s, bar + 0x88, write ? 0x2000 : 0x40000);
+            qtest_writeq(s, bar + 0x90, 1);
+            qtest_writeq(s, bar + 0x98, write ? 3 : 1);
+            qtest_clock_step(s, 100000000);
+            g_assert_cmphex(qtest_readq(s, bar + 0x98) & 1, ==, 0);
+        }
+        g_assert_cmphex(qtest_readb(s, output), ==, 0x41 + u);
+    }
+    qtest_qmp_assert_success(s, "{'execute':'qom-set','arguments':{"
+                            "'path':'/machine/peripheral/vi/tunix-secondary',"
+                            "'property':'tunix-qi-stall','value':true}}");
+    for (unsigned u = 0; u < 2; ++u) {
+        uint64_t queue = CMDBUF_ADDR + u * 4096;
+        uint64_t completion = 0x640000 + u * 8;
+        uint64_t base = AMDVI_BASE_ADDR + u * AMDVI_MMIO_SIZE;
+        qtest_writeq(s, queue + 16, (1ULL << 60) | completion | 5);
+        qtest_writeq(s, queue + 24, 0x1234 + u);
+        qtest_writeq(s, base + AMDVI_MMIO_COMMAND_TAIL, 32);
+    }
+    g_assert_cmphex(qtest_readq(s, 0x640000), ==, 0x1234);
+    g_assert_cmphex(qtest_readq(s, 0x640008), ==, 0);
+    qtest_qmp_assert_success(s, "{'execute':'qom-set','arguments':{"
+                            "'path':'/machine/peripheral/vi/tunix-secondary',"
+                            "'property':'tunix-qi-stall','value':false}}");
+    g_assert_cmphex(qtest_readq(s, 0x640008), ==, 0x1235);
+    qtest_qmp_assert_success(s, "{'execute':'qom-set','arguments':{"
+                            "'path':'/machine/peripheral/vi/tunix-secondary',"
+                            "'property':'tunix-fault-overflow','value':true}}");
+    g_assert_cmphex(qtest_readq(s, AMDVI_BASE_ADDR + AMDVI_MMIO_STATUS) & 1, ==, 0);
+    g_assert_cmphex(qtest_readq(s, AMDVI_BASE_ADDR + AMDVI_MMIO_SIZE +
+                              AMDVI_MMIO_STATUS) & 1, ==, 1);
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    qtest_add_data_func("/amd-iommu/split-engines", GINT_TO_POINTER(0), test_split_engines);
+    qtest_add_data_func("/amd-iommu/two-segments", GINT_TO_POINTER(1), test_split_engines);
     qtest_add_func("/q35/amd-iommu/cmdbuf-head-wrap", test_cmdbuf_head_wrap);
     qtest_add_func("/q35/amd-iommu/dma-fault-fields", test_dma_fault_fields);
     qtest_add_func("/q35/amd-iommu/cached-permission-fault", test_cached_permission_fault);

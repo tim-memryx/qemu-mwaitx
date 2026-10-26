@@ -312,6 +312,14 @@ struct AMDVIState {
     AMDVIPCIState *pci;         /* IOMMU PCI device             */
     char *pci_id;               /* ID of AMDVI-PCI device, if user created */
 
+    /* Opt-in two-engine qualification fixture; never a second default IOMMU. */
+    uint16_t tunix_split_devfn;
+    bool tunix_secondary;
+    AMDVIState *tunix_child;
+    PCIBus *tunix_root_bus;
+    Notifier tunix_machine_done;
+    Error *tunix_migration_blocker;
+
     uint32_t version;
 
     uint64_t mmio_addr;
@@ -377,5 +385,7 @@ struct AMDVIState {
 };
 
 uint64_t amdvi_extended_feature_register(AMDVIState *s);
+
+AMDVIState *amdvi_unit_for_device(AMDVIState *s, PCIBus *bus, int devfn);
 
 #endif

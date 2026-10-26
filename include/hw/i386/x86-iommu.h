@@ -64,8 +64,16 @@ struct X86IOMMUState {
     OnOffAuto intr_supported;   /* Whether vIOMMU supports IR */
     bool dt_supported;          /* Whether vIOMMU supports DT */
     bool dma_translation;       /* Whether vIOMMU supports DMA translation */
+    bool tunix_secondary_segment; /* bounded, non-migrating segment fixture */
+    PCIBus *tunix_segment_bus;
     QLIST_HEAD(, IEC_Notifier) iec_notifiers; /* IEC notify list */
 };
+
+#define TUNIX_SEGMENT_ECAM 0x50000000ULL
+#define TUNIX_SEGMENT_ECAM_SIZE (16ULL << 20)
+#define TUNIX_SEGMENT_MMIO 0x40000000ULL
+#define TUNIX_SEGMENT_MMIO_SIZE (256ULL << 20)
+PCIBus *x86_iommu_create_tunix_segment(X86IOMMUState *s, Error **errp);
 
 bool x86_iommu_ir_supported(X86IOMMUState *s);
 

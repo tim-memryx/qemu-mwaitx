@@ -82,3 +82,40 @@ AMD regressions run with `QTEST_QEMU_BINARY=/absolute/path/to/qemu-system-x86_64
 and check non-page-aligned fault addresses, cached read-only translations, parent
 permissions, masked overflow, interrupt bounds/suppression and queue consumption.
 The host controls are opt-in test fixtures, not hardware isolation qualification.
+
+## AMD two-engine topology
+
+`amd-iommu,id=vi,dma-remap=on,intremap=on,xtsup=on,device-iotlb=off,tunix-split-devfn=24`
+selects the same root-port subtree convention as the Intel fixture. Each engine
+has separate AMDVIState, device/interrupt translations, command/event queues and
+fault controls. The primary owns the IOAPIC; IVRS lists disjoint device scopes
+with legacy/extended alternatives for each unit. Register banks are 0xfed80000
+and 0xfed84000, PCI identities 00:12.0 and 00:13.0. Defaults retain the original
+single-engine device placement. The secondary QOM path is `vi/tunix-secondary`.
+Migration, host assignment, external PCI identity and device-IOTLB profiles are
+excluded. The root port must exist before machine initialization completes.
+
+`tests/qtest/amd-iommu-test` checks actual DMA using equal IOVAs with independent
+physical translations, primary completion while the secondary is stalled, resume,
+and isolated fault status. Tunix's `test-device-multi-unit`, `test-device-multi-queue`
+and `test-device-multi-overflow` plus their `-uefi` variants use
+`IOMMU_TEST_VENDOR=amd` for real guest DMA/MSI, route ownership, completion tokens,
+three queue-wrap rounds and secondary quarantine with primary reuse.
+
+## Bounded two-segment topology
+
+Add `tunix-secondary-segment=on` to either split-engine model and place the
+second root port on `bus=tunix-pcie.1`. This creates a separate PCI Express host,
+ECAM at 0x50000000 (16 MiB, buses 0..15), and a segment-1 MMIO window at
+0x40000000 (256 MiB). RAM is limited to 1 GiB. These apertures sit below the
+primary OVMF PCI aperture; placing them inside it can shadow firmware-assigned
+BARs before the OS boots. MCFG and `_SB.PC01` describe the independent root;
+PCI0's resources exclude its windows. The explicit preboot qtest fixture assigns
+segment-1 bridge/EDU BARs and enables ACS with readback. CF8 remains segment zero.
+
+The secondary engine owns segment 1, including its AMD IOMMU PCI identity.
+DMAR/IVRS describe separate real routing, not relabeled requests. Both segments
+may contain `01:00.0`; translations, interrupt tables, queues and faults remain
+independent. Only segment zero owns the IOAPIC. This fixture permits remapped MSI
+only on the new root, rejects migration/host assignment, and does not implement
+hotplug, general firmware resource allocation or physical multi-segment support.

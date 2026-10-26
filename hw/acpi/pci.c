@@ -38,8 +38,8 @@
  * PCI Firmware Specification, Revision 3.0
  * 4.1.2 MCFG Table Description.
  */
-void build_mcfg(GArray *table_data, BIOSLinker *linker, AcpiMcfgInfo *info,
-                const char *oem_id, const char *oem_table_id)
+void build_mcfg_segments(GArray *table_data, BIOSLinker *linker, AcpiMcfgInfo *info,
+                         size_t count, const char *oem_id, const char *oem_table_id)
 {
     AcpiTable table = { .sig = "MCFG", .rev = 1,
                         .oem_id = oem_id, .oem_table_id = oem_table_id };
@@ -52,18 +52,26 @@ void build_mcfg(GArray *table_data, BIOSLinker *linker, AcpiMcfgInfo *info,
      * Memory Mapped Enhanced Configuration Space Base Address Allocation
      * Structure
      */
-    /* Base address, processor-relative */
-    build_append_int_noprefix(table_data, info->base, 8);
-    /* PCI segment group number */
-    build_append_int_noprefix(table_data, 0, 2);
-    /* Starting PCI Bus number */
-    build_append_int_noprefix(table_data, 0, 1);
-    /* Final PCI Bus number */
-    build_append_int_noprefix(table_data, PCIE_MMCFG_BUS(info->size - 1), 1);
-    /* Reserved */
-    build_append_int_noprefix(table_data, 0, 4);
+    for (size_t segment = 0; segment < count; ++segment) {
+        /* Base address, processor-relative */
+        build_append_int_noprefix(table_data, info[segment].base, 8);
+        /* PCI segment group number */
+        build_append_int_noprefix(table_data, segment, 2);
+        /* Starting PCI Bus number */
+        build_append_int_noprefix(table_data, 0, 1);
+        /* Final PCI Bus number */
+        build_append_int_noprefix(table_data, PCIE_MMCFG_BUS(info[segment].size - 1), 1);
+        /* Reserved */
+        build_append_int_noprefix(table_data, 0, 4);
+    }
 
     acpi_table_end(linker, &table);
+}
+
+void build_mcfg(GArray *table_data, BIOSLinker *linker, AcpiMcfgInfo *info,
+                const char *oem_id, const char *oem_table_id)
+{
+    build_mcfg_segments(table_data, linker, info, 1, oem_id, oem_table_id);
 }
 
 typedef struct AcpiGenericInitiator {

@@ -1053,6 +1053,34 @@ build_dsdt(GArray *table_data, BIOSLinker *linker,
         }
     }
 
+    /* Bounded test root: firmware cannot reach this ECAM through CF8.
+     * The host fixture assigns its windows before firmware starts. */
+    X86IOMMUState *segment_iommu = x86_iommu_get_default();
+    if (segment_iommu && segment_iommu->tunix_secondary_segment) {
+        Aml *segment_scope = aml_scope("\\_SB");
+        Aml *segment = aml_device("PC01");
+        Aml *resources = aml_resource_template();
+        aml_append(segment, aml_name_decl("_HID", aml_eisaid("PNP0A08")));
+        aml_append(segment, aml_name_decl("_CID", aml_eisaid("PNP0A03")));
+        aml_append(segment, aml_name_decl("_UID", aml_int(1)));
+        aml_append(segment, aml_name_decl("_SEG", aml_int(1)));
+        aml_append(segment, aml_name_decl("_BBN", aml_int(0)));
+        aml_append(resources, aml_word_bus_number(AML_MIN_FIXED, AML_MAX_FIXED,
+                   AML_POS_DECODE, 0, 0, 15, 0, 16));
+        aml_append(resources, aml_dword_memory(AML_POS_DECODE, AML_MIN_FIXED,
+                   AML_MAX_FIXED, AML_NON_CACHEABLE, AML_READ_WRITE, 0,
+                   TUNIX_SEGMENT_MMIO,
+                   TUNIX_SEGMENT_MMIO + TUNIX_SEGMENT_MMIO_SIZE - 1,
+                   0, TUNIX_SEGMENT_MMIO_SIZE));
+        aml_append(segment, aml_name_decl("_CRS", resources));
+        aml_append(segment_scope, segment);
+        aml_append(dsdt, segment_scope);
+        crs_range_insert(crs_range_set.mem_ranges, TUNIX_SEGMENT_MMIO,
+                         TUNIX_SEGMENT_MMIO + TUNIX_SEGMENT_MMIO_SIZE - 1);
+        crs_range_insert(crs_range_set.mem_ranges, TUNIX_SEGMENT_ECAM,
+                         TUNIX_SEGMENT_ECAM + TUNIX_SEGMENT_ECAM_SIZE - 1);
+    }
+
     if (cxl_present) {
         build_acpi0017(dsdt);
     }
@@ -1674,19 +1702,24 @@ build_dmar_q35(GArray *table_data, BIOSLinker *linker, const char *oem_id,
     g_array_append_vals(table_data, rsvd10, sizeof(rsvd10)); /* Reserved */
 
     if (intel_iommu->tunix_child) {
-        /* Exact subtree first; the default unit below covers all other sources. */
+        /* Separate segments each have an INCLUDE_ALL unit; the original
+         * fixture instead delegates one subtree in segment zero. */
+        bool segment = iommu->tunix_secondary_segment;
         build_append_int_noprefix(table_data, 0, 2);
-        build_append_int_noprefix(table_data, 24, 2);
-        build_append_int_noprefix(table_data, 0, 4); /* Flags, reserved, segment */
-        build_append_int_noprefix(table_data,
-                                  TUNIX_SECOND_IOMMU_ADDR, 8);
-        build_append_int_noprefix(table_data, 2, 1); /* PCI subtree */
-        build_append_int_noprefix(table_data, 8, 1);
-        build_append_int_noprefix(table_data, 0, 4); /* Reserved, enum ID, bus 0 */
-        build_append_int_noprefix(table_data,
-                                  PCI_SLOT(intel_iommu->tunix_split_devfn), 1);
-        build_append_int_noprefix(table_data,
-                                  PCI_FUNC(intel_iommu->tunix_split_devfn), 1);
+        build_append_int_noprefix(table_data, segment ? 16 : 24, 2);
+        build_append_int_noprefix(table_data, segment ? 1 : 0, 1);
+        build_append_int_noprefix(table_data, 0, 1);
+        build_append_int_noprefix(table_data, segment ? 1 : 0, 2);
+        build_append_int_noprefix(table_data, TUNIX_SECOND_IOMMU_ADDR, 8);
+        if (!segment) {
+            build_append_int_noprefix(table_data, 2, 1);
+            build_append_int_noprefix(table_data, 8, 1);
+            build_append_int_noprefix(table_data, 0, 4);
+            build_append_int_noprefix(table_data,
+                                      PCI_SLOT(intel_iommu->tunix_split_devfn), 1);
+            build_append_int_noprefix(table_data,
+                                      PCI_FUNC(intel_iommu->tunix_split_devfn), 1);
+        }
         g_array_set_size(scope_blob, 0); /* INCLUDE_ALL supplies the remainder. */
     }
 
@@ -1768,10 +1801,22 @@ build_waet(GArray *table_data, BIOSLinker *linker, const char *oem_id,
  * Insert IVHD entry for device and recurse, insert alias, or insert range as
  * necessary for the PCI topology.
  */
+struct IvrsScope {
+    GArray *entries;
+    AMDVIState *root;
+    AMDVIState *unit;
+};
+
 static void
 insert_ivhd(PCIBus *bus, PCIDevice *dev, void *opaque)
 {
-    GArray *table_data = opaque;
+    struct IvrsScope *scope = opaque;
+    GArray *table_data = scope->entries;
+
+    if (!scope->root->iommu.tunix_secondary_segment &&
+        amdvi_unit_for_device(scope->root, bus, dev->devfn) != scope->unit) {
+        return; /* Exclude the whole subtree from the other engine's IVHD. */
+    }
     uint32_t entry;
 
     /* "Select" IVHD entry, type 0x2 */
@@ -1806,7 +1851,7 @@ insert_ivhd(PCIBus *bus, PCIDevice *dev, void *opaque)
                 entry = PCI_BUILD_BDF(sub, PCI_DEVFN(31, 7)) << 8 | 0x4;
                 build_append_int_noprefix(table_data, entry, 4);
             } else {
-                pci_for_each_device(sec_bus, sec, insert_ivhd, table_data);
+                pci_for_each_device(sec_bus, sec, insert_ivhd, opaque);
             }
         } else {
             /*
@@ -1843,13 +1888,18 @@ insert_ivhd(PCIBus *bus, PCIDevice *dev, void *opaque)
 static int
 ivrs_host_bridges(Object *obj, void *opaque)
 {
-    GArray *ivhd_blob = opaque;
 
+
+    struct IvrsScope *scope = opaque;
     if (object_dynamic_cast(obj, TYPE_PCI_HOST_BRIDGE)) {
         PCIBus *bus = PCI_HOST_BRIDGE(obj)->bus;
 
+        if (scope->root->iommu.tunix_secondary_segment &&
+            bus != scope->unit->tunix_root_bus) {
+            return 0;
+        }
         if (bus && !pci_bus_bypass_iommu(bus)) {
-            pci_for_each_device_under_bus(bus, insert_ivhd, ivhd_blob);
+            pci_for_each_device_under_bus(bus, insert_ivhd, opaque);
         }
     }
 
@@ -1857,25 +1907,11 @@ ivrs_host_bridges(Object *obj, void *opaque)
 }
 
 static void
-build_amd_iommu(GArray *table_data, BIOSLinker *linker, const char *oem_id,
-                const char *oem_table_id)
+build_amd_ivhd(GArray *table_data, AMDVIState *root, AMDVIState *s)
 {
-    AMDVIState *s = AMD_IOMMU_DEVICE(x86_iommu_get_default());
     GArray *ivhd_blob = g_array_new(false, true, 1);
-    AcpiTable table = { .sig = "IVRS", .rev = 1, .oem_id = oem_id,
-                        .oem_table_id = oem_table_id };
+    struct IvrsScope scope = { ivhd_blob, root, s };
     uint64_t feature_report;
-
-    acpi_table_begin(&table, table_data);
-    /* IVinfo - IO virtualization information common to all
-     * IOMMU units in a system
-     */
-    build_append_int_noprefix(table_data,
-                             (1UL << 0) | /* EFRSup */
-                             (40UL << 8), /* PASize */
-                             4);
-    /* reserved */
-    build_append_int_noprefix(table_data, 0, 8);
 
     /*
      * A PCI bus walk, for each PCI host bridge, is necessary to create a
@@ -1885,9 +1921,9 @@ build_amd_iommu(GArray *table_data, BIOSLinker *linker, const char *oem_id,
      * is sufficient when no aliases are present.
      */
     object_child_foreach_recursive(object_get_root(),
-                                   ivrs_host_bridges, ivhd_blob);
+                                   ivrs_host_bridges, &scope);
 
-    if (!ivhd_blob->len) {
+    if (!ivhd_blob->len && !root->tunix_child) {
         /*
          *   Type 1 device entry reporting all devices
          *   These are 4-byte device entries currently reporting the range of
@@ -1904,7 +1940,7 @@ build_amd_iommu(GArray *table_data, BIOSLinker *linker, const char *oem_id,
      * Linux IOMMU driver checks for the special IVHD device (type IO-APIC).
      * See Linux kernel commit 'c2ff5cf5294bcbd7fa50f7d860e90a66db7e5059'
      */
-    if (x86_iommu_ir_supported(x86_iommu_get_default())) {
+    if (s == root && x86_iommu_ir_supported(&s->iommu)) {
         build_append_int_noprefix(ivhd_blob,
                                  (0x1ull << 56) |           /* type IOAPIC */
                                  (IOAPIC_SB_DEVID << 40) |  /* IOAPIC devid */
@@ -1933,7 +1969,8 @@ build_amd_iommu(GArray *table_data, BIOSLinker *linker, const char *oem_id,
     /* IOMMU base address */
     build_append_int_noprefix(table_data, s->mr_mmio.addr, 8);
     /* PCI Segment Group */
-    build_append_int_noprefix(table_data, 0, 2);
+    build_append_int_noprefix(table_data,
+        root->iommu.tunix_secondary_segment && s != root ? 1 : 0, 2);
     /* IOMMU info */
     build_append_int_noprefix(table_data, 0, 2);
     /* IOMMU Feature Reporting */
@@ -1968,7 +2005,8 @@ build_amd_iommu(GArray *table_data, BIOSLinker *linker, const char *oem_id,
     /* IOMMU base address */
     build_append_int_noprefix(table_data, s->mr_mmio.addr, 8);
     /* PCI Segment Group */
-    build_append_int_noprefix(table_data, 0, 2);
+    build_append_int_noprefix(table_data,
+        root->iommu.tunix_secondary_segment && s != root ? 1 : 0, 2);
     /* IOMMU info */
     build_append_int_noprefix(table_data, 0, 2);
     /* IOMMU Attributes */
@@ -1988,6 +2026,31 @@ build_amd_iommu(GArray *table_data, BIOSLinker *linker, const char *oem_id,
     g_array_append_vals(table_data, ivhd_blob->data, ivhd_blob->len);
 
     g_array_free(ivhd_blob, TRUE);
+}
+
+static void
+build_amd_iommu(GArray *table_data, BIOSLinker *linker, const char *oem_id,
+                const char *oem_table_id)
+{
+    AMDVIState *s = AMD_IOMMU_DEVICE(x86_iommu_get_default());
+    AcpiTable table = { .sig = "IVRS", .rev = 1, .oem_id = oem_id,
+                        .oem_table_id = oem_table_id };
+
+    acpi_table_begin(&table, table_data);
+    /* IVinfo - IO virtualization information common to all
+     * IOMMU units in a system
+     */
+    build_append_int_noprefix(table_data,
+                             (1UL << 0) | /* EFRSup */
+                             (40UL << 8), /* PASize */
+                             4);
+    /* reserved */
+    build_append_int_noprefix(table_data, 0, 8);
+
+    build_amd_ivhd(table_data, s, s);
+    if (s->tunix_child) {
+        build_amd_ivhd(table_data, s, s->tunix_child);
+    }
     acpi_table_end(linker, &table);
 }
 
@@ -2157,8 +2220,15 @@ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
     }
     if (acpi_get_mcfg(&mcfg)) {
         acpi_add_table(table_offsets, tables_blob);
-        build_mcfg(tables_blob, tables->linker, &mcfg, x86ms->oem_id,
-                   x86ms->oem_table_id);
+        if (iommu && X86_IOMMU_DEVICE(iommu)->tunix_secondary_segment) {
+            AcpiMcfgInfo segments[] = { mcfg,
+                { .base = TUNIX_SEGMENT_ECAM, .size = TUNIX_SEGMENT_ECAM_SIZE } };
+            build_mcfg_segments(tables_blob, tables->linker, segments, 2,
+                                x86ms->oem_id, x86ms->oem_table_id);
+        } else {
+            build_mcfg(tables_blob, tables->linker, &mcfg, x86ms->oem_id,
+                       x86ms->oem_table_id);
+        }
     }
     if (object_dynamic_cast(OBJECT(iommu), TYPE_AMD_IOMMU_DEVICE)) {
         acpi_add_table(table_offsets, tables_blob);
