@@ -867,6 +867,7 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w);
 #define CPUID_EXT3_TOPOEXT (1U << 22)
 #define CPUID_EXT3_PERFCORE (1U << 23)
 #define CPUID_EXT3_PERFNB  (1U << 24)
+#define CPUID_EXT3_MWAITX  (1U << 29)
 
 #define CPUID_SVM_NPT             (1U << 0)
 #define CPUID_SVM_LBRV            (1U << 1)

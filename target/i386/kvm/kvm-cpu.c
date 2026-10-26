@@ -46,6 +46,13 @@ static bool kvm_cpu_realizefn(CPUState *cs, Error **errp)
     CPUX86State *env = &cpu->env;
     bool ret;
 
+    /* An explicit +mwaitx must not bypass the automatic migration filter. */
+    if ((env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_MWAITX) &&
+        cpu->migratable) {
+        error_setg(errp, "mwaitx requires migratable=off");
+        return false;
+    }
+
     /*
      * The realize order is important, since x86_cpu_realize() checks if
      * nothing else has been set by the user (or by accelerators) in

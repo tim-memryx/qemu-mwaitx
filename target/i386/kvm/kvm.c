@@ -566,6 +566,25 @@ uint32_t kvm_arch_get_supported_cpuid(KVMState *s, uint32_t function,
          * us to keep CPU models including TOPOEXT runnable on older kernels.
          */
         ret |= CPUID_EXT3_TOPOEXT;
+        /*
+         * KVM normally hides MONITORX/MWAITX because intercepted execution
+         * does not implement a native timed wait. With cpu-pm, the VM has
+         * enabled KVM's MWAIT interception-disable capability before CPUs
+         * are created. Only expose instructions actually present on the host.
+         * The CPU feature policy separately excludes migration and TCG.
+         */
+        ret &= ~CPUID_EXT3_MWAITX;
+        if (enable_cpu_pm &&
+            (kvm_check_extension(s, KVM_CAP_X86_DISABLE_EXITS) &
+             KVM_X86_DISABLE_EXITS_MWAIT)) {
+            uint32_t ecx, max_ext;
+
+            host_cpuid(0x80000000, 0, &max_ext, &unused, &unused, &unused);
+            if (max_ext >= 0x80000001) {
+                host_cpuid(0x80000001, 0, &unused, &unused, &ecx, &unused);
+                ret |= ecx & CPUID_EXT3_MWAITX;
+            }
+        }
     } else if (function == 0x80000001 && reg == R_EDX) {
         /* On Intel, kvm returns cpuid according to the Intel spec,
          * so add missing bits according to the AMD spec:
@@ -1812,6 +1831,7 @@ static int hyperv_init_vcpu(X86CPU *cpu)
 }
 
 static Error *invtsc_mig_blocker;
+static Error *mwaitx_mig_blocker;
 
 static void kvm_init_xsave(CPUX86State *env)
 {
@@ -2464,6 +2484,17 @@ int kvm_arch_init_vcpu(CPUState *cs)
         has_msr_mcg_ext_ctl = has_msr_feature_control = true;
     }
 
+    if ((env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_MWAITX) &&
+        mwaitx_mig_blocker == NULL) {
+        error_setg(&mwaitx_mig_blocker,
+                   "Native mwaitx monitor state cannot be migrated");
+        r = migrate_add_blocker(&mwaitx_mig_blocker, &local_err);
+        if (r < 0) {
+            error_report_err(local_err);
+            return r;
+        }
+    }
+
     if (!env->user_tsc_khz) {
         if ((env->features[FEAT_8000_0007_EDX] & CPUID_APM_INVTSC) &&
             invtsc_mig_blocker == NULL) {
@@ -2529,6 +2560,7 @@ int kvm_arch_init_vcpu(CPUState *cs)
 
  fail:
     migrate_del_blocker(&invtsc_mig_blocker);
+    migrate_del_blocker(&mwaitx_mig_blocker);
 
     return r;
 }

@@ -1106,7 +1106,7 @@ FeatureWordInfo feature_word_info[FEATURE_WORDS] = {
             "fma4", "tce", NULL, "nodeid-msr",
             NULL, "tbm", "topoext", "perfctr-core",
             "perfctr-nb", NULL, NULL, NULL,
-            NULL, NULL, NULL, NULL,
+            NULL, "mwaitx", NULL, NULL,
         },
         .cpuid = { .eax = 0x80000001, .reg = R_ECX, },
         .tcg_features = TCG_EXT3_FEATURES,
@@ -1116,6 +1116,8 @@ FeatureWordInfo feature_word_info[FEATURE_WORDS] = {
          * to be provided so it doesn't confuse guests.
          */
         .no_autoenable_flags = CPUID_EXT3_TOPOEXT,
+        /* The host's monitor state cannot be transferred during migration. */
+        .unmigratable_flags = CPUID_EXT3_MWAITX,
     },
     [FEAT_C000_0001_EDX] = {
         .type = CPUID_FEATURE_WORD,
