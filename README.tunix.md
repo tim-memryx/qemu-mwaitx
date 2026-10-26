@@ -5,6 +5,17 @@
 * Intel VT-d compatibility-format interrupt blocking according to GSTS.CFIS and
   EIME, including fault reason 0x25. Architected register state already carries
   CFIS through reset/migration. Valid remappable messages keep SID validation.
+* Native AMD MONITORX/MWAITX exposure, gated by host CPUID, KVM's MWAIT
+  interception-disable capability, `-overcommit cpu-pm=on`, and
+  `-cpu host,migratable=off`. Explicit `mwaitx=off` is respected. TCG and
+  migratable CPU profiles cannot enable it; live migration is blocked even
+  when invariant TSC is masked. No host kernel patch is needed on the
+  qualified Ryzen 9950X / Linux 7.2.12 host.
+* AMD-Vi fault records retain full requester IDs, domain IDs and addresses;
+  cached permission denials report faults, page walks preserve cumulative parent
+  permissions, and event-log overflow is recorded with interrupts masked.
+  Interrupt-table bounds are checked and rejected interrupts produce attributed
+  events while respecting IG/SupIOPF suppression.
 * Host-only retirement test fixtures. They do not modify guest CPUID, manufacture
   hardware completions, or relax translation/interrupt isolation.
 
@@ -14,6 +25,8 @@ The fixtures are mutable QOM properties, intended only for non-migrating tests:
 | --- | --- | --- |
 | intel-iommu / `tunix-qi-stall` | false | Retains an accepted queue tail without fetching descriptors. Clearing resumes real descriptor execution; system reset clears it. |
 | intel-iommu / `tunix-fault-overflow` | false | Sets architected primary fault-log overflow and generates its normal fault event, leaving translation operational. Getter reads the real sticky bit; guest W1C or setting false clears it. |
+| amd-iommu / `tunix-qi-stall` | false | Stops command consumption; clearing resumes actual commands and completions. DMA/IRQ translation continues; reset clears the control. |
+| amd-iommu / `tunix-fault-overflow` | false | Sets the real event-log overflow bit and signals its enabled event interrupt; normal W1C or setting false clears it. |
 | edu / `tunix-dma-delay-ms` | 100 | Delay for the next DMA timer, clamped to 60,000 ms. Changing it does not reschedule an already-issued command. |
 | edu / `tunix-dma-completions` | 0, read-only | Actual DMA timer callbacks that retire a RUN command. |
 | edu / `tunix-dma-failures` | 0, read-only | PCI DMA transactions returning a result other than MEMTX_OK. |
@@ -33,6 +46,13 @@ It also checks held-doorbell visibility, real readback-triggered DMA, cancellati
 of the original posted timer, and failed readback with a later BME-blocked command.
 These fixtures model a missing retirement proof, not arbitrary PCIe fabric timing.
 Run with `QTEST_QEMU_BINARY` pointing at the corresponding built emulator.
+
+`python3 tests/tunix-mwaitx.py /path/to/qemu-system-x86_64` checks native CPU
+policy and migration refusal on an MWAITX-capable AMD/KVM host. Tunix's
+`make test-mwaitx USER_TEST_CPUS=2` separately qualifies actual CPL3 execution,
+bounded timer/store waits and KVM exit counts. CPU enumeration alone is not
+execution evidence. KVM control semantics are documented at
+https://docs.kernel.org/virt/kvm/api.html#kvm-cap-x86-disable-exits.
 
 ## Two-engine qualification topology
 
@@ -56,3 +76,9 @@ ATS and PASID. Hotplug is not qualified. It is not a general multi-segment or
 physical-platform model. Both engines use the primary's capability options.
 The split-engine qtest checks independent real EDU DMA translations, MSI source
 faults, queue progress/stalling, overflow, reset, and the emitted DMAR scopes.
+
+AMD regressions run with `QTEST_QEMU_BINARY=/absolute/path/to/qemu-system-x86_64
+/path/to/build/tests/qtest/amd-iommu-test`. They use a real downstream EDU requester
+and check non-page-aligned fault addresses, cached read-only translations, parent
+permissions, masked overflow, interrupt bounds/suppression and queue consumption.
+The host controls are opt-in test fixtures, not hardware isolation qualification.

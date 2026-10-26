@@ -317,6 +317,7 @@ struct AMDVIState {
     uint64_t mmio_addr;
 
     bool enabled;                /* IOMMU enabled                */
+    bool tunix_qi_stall;         /* host-only queue consumption fixture */
     bool cmdbuf_enabled;         /* command buffer enabled       */
     bool evtlog_enabled;         /* event log enabled            */
     bool excl_enabled;

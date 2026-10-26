@@ -291,9 +291,9 @@ static void amdvi_log_event(AMDVIState *s, uint64_t *evt)
 
     /* event log buffer full */
     if (evtlog_tail_next == s->evtlog_head) {
+        amdvi_assign_orq(s, AMDVI_MMIO_STATUS, AMDVI_MMIO_STATUS_EVT_OVF);
         /* generate overflow interrupt */
         if (s->evtlog_intr) {
-            amdvi_assign_orq(s, AMDVI_MMIO_STATUS, AMDVI_MMIO_STATUS_EVT_OVF);
             amdvi_generate_msi_interrupt(s);
         }
         return;
@@ -323,7 +323,7 @@ static void amdvi_setevent_bits(uint64_t *buffer, uint64_t value, int start,
                                 int length)
 {
     int index = start / 64, bitpos = start % 64;
-    uint64_t mask = MAKE_64BIT_MASK(start, length);
+    uint64_t mask = MAKE_64BIT_MASK(bitpos, length);
     buffer[index] &= ~mask;
     buffer[index] |= (value << bitpos) & mask;
 }
@@ -348,12 +348,13 @@ static void amdvi_encode_event(uint64_t *evt, uint16_t devid, uint64_t addr,
  * @addr: virtual address in translation request
  */
 static void amdvi_page_fault(AMDVIState *s, uint16_t devid,
-                             hwaddr addr, uint16_t info)
+                             hwaddr addr, uint16_t info, uint16_t domain)
 {
     uint64_t evt[2];
 
-    info |= AMDVI_EVENT_IOPF_I | AMDVI_EVENT_IOPF;
+    info |= AMDVI_EVENT_IOPF;
     amdvi_encode_event(evt, devid, addr, info);
+    evt[0] |= (uint64_t)domain << 32;
     amdvi_log_event(s, evt);
     pci_word_test_and_set_mask(s->pci->dev.config + PCI_STATUS,
             PCI_STATUS_SIG_TARGET_ABORT);
@@ -594,7 +595,10 @@ static bool amdvi_validate_dte(AMDVIState *s, uint16_t devid,
     if ((dte[0] & AMDVI_DTE_QUAD0_RESERVED) ||
         (dte[1] & AMDVI_DTE_QUAD1_RESERVED) ||
         (dte[2] & AMDVI_DTE_QUAD2_RESERVED) ||
-        (dte[3] & AMDVI_DTE_QUAD3_RESERVED)) {
+        (dte[3] & AMDVI_DTE_QUAD3_RESERVED) ||
+        ((dte[2] & AMDVI_IR_REMAP_ENABLE) &&
+         extract64(dte[2], AMDVI_IR_INTCTL_SHIFT, 2) == AMDVI_IR_INTCTL_REMAP &&
+         extract64(dte[2], 1, 4) > 11)) {
         amdvi_log_illegaldevtab_error(s, devid,
                                       s->devtab +
                                       devid * AMDVI_DEVTAB_ENTRY_SIZE, 0);
@@ -780,7 +784,8 @@ static int fetch_pte(AMDVIAddressSpace *as, hwaddr address, uint64_t dte,
      * Pointer and indexing the top level table using the IOVA from the request.
      */
     pte_addr = NEXT_PTE_ADDR(dte, pt_level, address);
-    *pte = amdvi_get_pte_entry(as->iommu_state, pte_addr, as->devfn);
+    *pte = amdvi_get_pte_entry(as->iommu_state, pte_addr,
+                               PCI_BUILD_BDF(pci_bus_num(as->bus), as->devfn));
 
     if (*pte == (uint64_t)-1) {
         /*
@@ -805,6 +810,9 @@ static int fetch_pte(AMDVIAddressSpace *as, hwaddr address, uint64_t dte,
 
         /* Permission bits are ANDed at every level, including the DTE */
         perms &= amdvi_get_perms(*pte);
+        /* Return cumulative permissions, not just the final leaf's bits. */
+        *pte = (*pte & ~(AMDVI_DEV_PERM_READ | AMDVI_DEV_PERM_WRITE)) |
+               ((uint64_t)perms << AMDVI_DEV_PERM_SHIFT);
         if (perms == IOMMU_NONE) {
             return 0;
         }
@@ -836,7 +844,8 @@ static int fetch_pte(AMDVIAddressSpace *as, hwaddr address, uint64_t dte,
         *page_size = PTE_LEVEL_PAGE_SIZE(pt_level);
 
         pte_addr = NEXT_PTE_ADDR(*pte, pt_level, address);
-        *pte = amdvi_get_pte_entry(as->iommu_state, pte_addr, as->devfn);
+        *pte = amdvi_get_pte_entry(as->iommu_state, pte_addr,
+                               PCI_BUILD_BDF(pci_bus_num(as->bus), as->devfn));
 
         if (*pte == (uint64_t)-1) {
             /* Failure to read PTE. Page walk skips a page_size chunk */
@@ -944,7 +953,7 @@ static void amdvi_sync_shadow_page_table_range(AMDVIAddressSpace *as,
     hwaddr iova = addr;
     hwaddr end = iova + size - 1;
 
-    uint64_t pte;
+    uint64_t pte = 0;
     int ret;
 
     while (iova < end) {
@@ -1586,6 +1595,10 @@ static void amdvi_cmdbuf_run(AMDVIState *s)
         return;
     }
 
+    if (s->tunix_qi_stall) {
+        return;
+    }
+
     /* check if there is work to do. */
     while (s->cmdbuf_head != s->cmdbuf_tail) {
         trace_amdvi_command_exec(s->cmdbuf_head, s->cmdbuf_tail, s->cmdbuf);
@@ -1895,7 +1908,7 @@ static void amdvi_page_walk(AMDVIAddressSpace *as, uint64_t *dte,
 {
     hwaddr page_mask, pagesize = 0;
     uint8_t mode;
-    uint64_t pte;
+    uint64_t pte = 0;
     int fetch_ret;
 
     /* make sure the DTE has TV = 1 */
@@ -1930,7 +1943,16 @@ static void amdvi_page_walk(AMDVIAddressSpace *as, uint64_t *dte,
     if (fetch_ret < 0 || !IOMMU_PTE_PRESENT(pte) ||
         perms != (perms & amdvi_get_perms(pte))) {
 
-        amdvi_page_fault(as->iommu_state, as->devfn, addr, perms);
+        uint16_t info = (perms & AMDVI_PERM_WRITE) ? (1U << 5) : 0;
+        if (IOMMU_PTE_PRESENT(pte)) {
+            info |= 1U << 4; /* PR: present translation. */
+            if (perms != (perms & amdvi_get_perms(pte))) {
+                info |= 1U << 6; /* PE: insufficient effective permissions. */
+            }
+        }
+        amdvi_page_fault(as->iommu_state,
+                        PCI_BUILD_BDF(pci_bus_num(as->bus), as->devfn),
+                        addr, info, dte[1] & AMDVI_DEV_DOMID_ID_MASK);
         trace_amdvi_page_fault(addr);
         return;
     }
@@ -1963,6 +1985,14 @@ static void amdvi_do_translate(AMDVIAddressSpace *as, hwaddr addr,
     int dte_ret;
 
     if (iotlb_entry) {
+        unsigned requested = is_write ? AMDVI_PERM_WRITE : AMDVI_PERM_READ;
+        if (!(iotlb_entry->perms & requested)) {
+            /* A cached read-only mapping still owes a write-fault event. */
+            amdvi_page_fault(s, devid, addr,
+                            (1U << 4) | (1U << 6) | (is_write ? 1U << 5 : 0),
+                            iotlb_entry->domid);
+            return;
+        }
         trace_amdvi_iotlb_hit(PCI_BUS_NUM(devid), PCI_SLOT(devid),
                 PCI_FUNC(devid), addr, iotlb_entry->translated_addr);
         ret->iova = addr & ~iotlb_entry->page_mask;
@@ -2044,6 +2074,10 @@ static int amdvi_get_irte(AMDVIState *s, MSIMessage *origin, uint64_t *dte,
 
     irte_root = dte[2] & AMDVI_IR_PHYS_ADDR_MASK;
     offset = (origin->data & AMDVI_IRTE_OFFSET) << 2;
+    unsigned length = extract64(dte[2], 1, 4);
+    if (length > 11 || (origin->data & AMDVI_IRTE_OFFSET) >= (1U << length)) {
+        return -AMDVI_IR_TARGET_ABORT;
+    }
 
     trace_amdvi_ir_irte(irte_root, offset);
 
@@ -2064,7 +2098,7 @@ static int amdvi_int_remap_legacy(AMDVIState *iommu,
                                   MSIMessage *translated,
                                   uint64_t *dte,
                                   X86IOMMUIrq *irq,
-                                  uint16_t sid)
+                                  uint16_t sid, uint16_t *fault_info, bool *suppress)
 {
     uint8_t int_type;
     uint32_t irte;
@@ -2076,6 +2110,10 @@ static int amdvi_int_remap_legacy(AMDVIState *iommu,
         return ret;
     }
 
+    *suppress |= !!(irte & 2); /* SupIOPF is meaningful even when invalid. */
+    if (irte & 1) {
+        *fault_info |= 1U << 4; /* PR: remapped interrupt. */
+    }
     if (!FIELD_EX32(irte, AMDVI_IRTE, VALID)) {
         trace_amdvi_ir_target_abort("RemapEn is disabled");
         return -AMDVI_IR_TARGET_ABORT;
@@ -2108,6 +2146,10 @@ static int amdvi_get_irte_ga(AMDVIState *s, MSIMessage *origin, uint64_t *dte,
 
     irte_root = dte[2] & AMDVI_IR_PHYS_ADDR_MASK;
     offset = (origin->data & AMDVI_IRTE_OFFSET) << 4;
+    unsigned length = extract64(dte[2], 1, 4);
+    if (length > 11 || (origin->data & AMDVI_IRTE_OFFSET) >= (1U << length)) {
+        return -AMDVI_IR_TARGET_ABORT;
+    }
     trace_amdvi_ir_irte(irte_root, offset);
 
     if (dma_memory_read(&address_space_memory, irte_root + offset,
@@ -2127,7 +2169,7 @@ static int amdvi_int_remap_ga(AMDVIState *iommu,
                               MSIMessage *translated,
                               uint64_t *dte,
                               X86IOMMUIrq *irq,
-                              uint16_t sid)
+                              uint16_t sid, uint16_t *fault_info, bool *suppress)
 {
     AMDVIIrteGA irte;
     uint8_t int_type;
@@ -2139,6 +2181,10 @@ static int amdvi_int_remap_ga(AMDVIState *iommu,
         return ret;
     }
 
+    *suppress |= !!(irte.ga_lo & 2);
+    if (irte.ga_lo & 1) {
+        *fault_info |= 1U << 4;
+    }
     if (!FIELD_EX64(irte.ga_lo, AMDVI_IRTE_GA_LO, VALID)) {
         trace_amdvi_ir_target_abort("RemapEn is disabled");
         return -AMDVI_IR_TARGET_ABORT;
@@ -2176,7 +2222,7 @@ static int __amdvi_int_remap_msi(AMDVIState *iommu,
                                  MSIMessage *translated,
                                  uint64_t *dte,
                                  X86IOMMUIrq *irq,
-                                 uint16_t sid)
+                                 uint16_t sid, uint16_t *fault_info, bool *suppress)
 {
     int ret;
     uint8_t int_ctl;
@@ -2199,9 +2245,11 @@ static int __amdvi_int_remap_msi(AMDVIState *iommu,
     }
 
     if (iommu->ga_enabled) {
-        ret = amdvi_int_remap_ga(iommu, origin, translated, dte, irq, sid);
+        ret = amdvi_int_remap_ga(iommu, origin, translated, dte, irq, sid,
+                                 fault_info, suppress);
     } else {
-        ret = amdvi_int_remap_legacy(iommu, origin, translated, dte, irq, sid);
+        ret = amdvi_int_remap_legacy(iommu, origin, translated, dte, irq, sid,
+                                 fault_info, suppress);
     }
 
     return ret;
@@ -2218,6 +2266,8 @@ static int amdvi_int_remap_msi(AMDVIState *iommu,
     uint64_t dte[4] = { 0 };
     X86IOMMUIrq irq = { 0 };
     uint8_t dest_mode, delivery_mode;
+    uint16_t fault_info = AMDVI_EVENT_IOPF_I;
+    bool suppress = false;
 
     assert(origin && translated);
 
@@ -2270,13 +2320,15 @@ static int amdvi_int_remap_msi(AMDVIState *iommu,
      * https://pdfs.semanticscholar.org/presentation/9420/c279e942eca568157711ef5c92b800c40a79.pdf
      * (page 5)
      */
+    suppress = !!(dte[2] & (1ULL << 5)); /* IG: ignore unmapped interrupts. */
     delivery_mode = (origin->data >> MSI_DATA_DELIVERY_MODE_SHIFT) & 7;
 
     switch (delivery_mode) {
     case AMDVI_IOAPIC_INT_TYPE_FIXED:
     case AMDVI_IOAPIC_INT_TYPE_ARBITRATED:
         trace_amdvi_ir_delivery_mode("fixed/arbitrated");
-        ret = __amdvi_int_remap_msi(iommu, origin, translated, dte, &irq, sid);
+        ret = __amdvi_int_remap_msi(iommu, origin, translated, dte, &irq, sid,
+                                    &fault_info, &suppress);
         if (ret < 0) {
             goto remap_fail;
         } else {
@@ -2337,6 +2389,12 @@ out:
     return 0;
 
 remap_fail:
+    /* Rejected MSI and IOAPIC requests owe the same attributed event as DMA.
+     * No expected source/address is supplied by the guest test harness. */
+    if (!suppress) {
+        amdvi_page_fault(iommu, sid, origin->address, fault_info,
+                        dte[1] & AMDVI_DEV_DOMID_ID_MASK);
+    }
     return ret;
 }
 
@@ -2369,7 +2427,6 @@ static MemTxResult amdvi_mem_ir_write(void *opaque, hwaddr addr,
 
     ret = amdvi_int_remap_msi(opaque, &from, &to, sid);
     if (ret < 0) {
-        /* TODO: log the event using IOMMU log event interface */
         error_report_once("failed to remap interrupt from devid 0x%x", sid);
         return MEMTX_ERROR;
     }
@@ -2602,6 +2659,7 @@ static void amdvi_sysbus_reset(DeviceState *dev)
 {
     AMDVIState *s = AMD_IOMMU_DEVICE(dev);
 
+    s->tunix_qi_stall = false;
     msi_reset(&s->pci->dev);
     amdvi_init(s);
 
@@ -2764,6 +2822,50 @@ static const VMStateDescription vmstate_amdvi_sysbus = {
     .unmigratable = 1
 };
 
+/* Host-only diagnostics: stall consumption, never translation or completion data. */
+static bool amdvi_tunix_stall_get(Object *obj, Error **errp)
+{
+    return AMD_IOMMU_DEVICE(obj)->tunix_qi_stall;
+}
+
+static void amdvi_tunix_stall_set(Object *obj, bool value, Error **errp)
+{
+    AMDVIState *s = AMD_IOMMU_DEVICE(obj);
+
+    s->tunix_qi_stall = value;
+    if (!value && s->cmdbuf_enabled) {
+        amdvi_cmdbuf_run(s);
+    }
+}
+
+static bool amdvi_tunix_overflow_get(Object *obj, Error **errp)
+{
+    return amdvi_test_mask(AMD_IOMMU_DEVICE(obj), AMDVI_MMIO_STATUS,
+                          AMDVI_MMIO_STATUS_EVT_OVF);
+}
+
+static void amdvi_tunix_overflow_set(Object *obj, bool value, Error **errp)
+{
+    AMDVIState *s = AMD_IOMMU_DEVICE(obj);
+
+    if (value) {
+        amdvi_assign_orq(s, AMDVI_MMIO_STATUS, AMDVI_MMIO_STATUS_EVT_OVF);
+        if (s->evtlog_intr) {
+            amdvi_generate_msi_interrupt(s);
+        }
+    } else {
+        amdvi_assign_andq(s, AMDVI_MMIO_STATUS, ~AMDVI_MMIO_STATUS_EVT_OVF);
+    }
+}
+
+static void amdvi_sysbus_instance_init(Object *obj)
+{
+    object_property_add_bool(obj, "tunix-qi-stall", amdvi_tunix_stall_get,
+                             amdvi_tunix_stall_set);
+    object_property_add_bool(obj, "tunix-fault-overflow", amdvi_tunix_overflow_get,
+                             amdvi_tunix_overflow_set);
+}
+
 static void amdvi_sysbus_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -2783,6 +2885,7 @@ static const TypeInfo amdvi_sysbus = {
     .name = TYPE_AMD_IOMMU_DEVICE,
     .parent = TYPE_X86_IOMMU_DEVICE,
     .instance_size = sizeof(AMDVIState),
+    .instance_init = amdvi_sysbus_instance_init,
     .class_init = amdvi_sysbus_class_init
 };
 
