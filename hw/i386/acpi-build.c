@@ -21,6 +21,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/i386/tunix_ec.h"
 #include "qapi/error.h"
 #include "qobject/qnum.h"
 #include "acpi-build.h"
@@ -1080,6 +1081,8 @@ build_dsdt(GArray *table_data, BIOSLinker *linker,
         crs_range_insert(crs_range_set.mem_ranges, TUNIX_SEGMENT_ECAM,
                          TUNIX_SEGMENT_ECAM + TUNIX_SEGMENT_ECAM_SIZE - 1);
     }
+
+    tunix_ec_build_aml(dsdt);
 
     if (cxl_present) {
         build_acpi0017(dsdt);
@@ -2217,6 +2220,10 @@ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
             build_hmat(tables_blob, tables->linker, machine->numa_state,
                        x86ms->oem_id, x86ms->oem_table_id);
         }
+    }
+    if (tunix_ec_has_ecdt()) {
+        acpi_add_table(table_offsets, tables_blob);
+        tunix_ec_build_ecdt(tables_blob, tables->linker, x86ms->oem_id, x86ms->oem_table_id);
     }
     if (acpi_get_mcfg(&mcfg)) {
         acpi_add_table(table_offsets, tables_blob);

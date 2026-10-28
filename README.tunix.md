@@ -119,3 +119,20 @@ may contain `01:00.0`; translations, interrupt tables, queues and faults remain
 independent. Only segment zero owns the IOAPIC. This fixture permits remapped MSI
 only on the new root, rejects migration/host assignment, and does not implement
 hotplug, general firmware resource allocation or physical multi-segment support.
+
+## ACPI embedded-controller fixture
+
+`-device tunix-ec,id=ec0` is an opt-in Q35-only port-I/O EC at 0x62/0x66.
+It supplies 256 bytes, RD_EC/WR_EC/QR_EC, ECDT and namespace AML for early
+module-level access, `_REG`, `_INI` and `_Q42`. `ecdt=off`, `global-lock=on`
+and `stuck=on` select qualification profiles. A QOM write of 0x42 to `query`
+raises the fixture's otherwise-unused GPE 7. Read-only QOM `value`, `reads`,
+`errors` and `region-ready` distinguish actual EC transactions from serial
+messages. Reset clears controller state and counters; migration/hotplug are
+unsupported. This does not emulate SMM lock contention or a physical EC.
+
+`tests/qtest/tunix-ec-test` exercises all byte addresses, query delivery, reset,
+invalid sequencing and stuck status. Tunix's `test-acpi-ec` and UEFI variant
+exercise the firmware/runtime path with both IOMMU vendors. The second-segment
+fixture may also be left at reset for Tunix's explicit boot-allocation provider;
+`test-pci-boot-allocation` verifies kernel assignments without host config writes.
